@@ -274,6 +274,20 @@ class VitsDataModule(L.LightningDataModule):
         _LOGGER.info("Processed %s utterance(s)", num_utterances)
 
     def setup(self, stage: str) -> None:
+        if self.piper_config is None:
+            if not self.config_path.exists():
+                raise RuntimeError(
+                    f"piper_config is None and config_path doesn't exist: {self.config_path}"
+                )
+
+            with open(self.config_path, "r", encoding="utf-8") as config_file:
+                cfg_dict = json.load(config_file)
+
+            if hasattr(PiperConfig, "from_dict"):
+                self.piper_config = PiperConfig.from_dict(cfg_dict)
+            else:
+                self.piper_config = PiperConfig(**cfg_dict)
+
         assert self.piper_config is not None
 
         all_utts: list[CachedUtterance] = []

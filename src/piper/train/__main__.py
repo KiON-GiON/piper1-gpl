@@ -2,9 +2,12 @@ import logging
 
 import torch
 from lightning.pytorch.cli import LightningCLI
+from lightning.pytorch.callbacks import ModelCheckpoint
+
 
 from .vits.dataset import VitsDataModule
 from .vits.lightning import VitsModel
+from .callbacks import LastCheckpoint  
 
 _LOGGER = logging.getLogger(__package__)
 
@@ -19,6 +22,9 @@ class VitsLightningCLI(LightningCLI):
         parser.link_arguments("model.hop_length", "data.hop_length")
         parser.link_arguments("model.win_length", "data.win_length")
         parser.link_arguments("model.segment_size", "data.segment_size")
+        # checkpoint callback
+        parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
+        parser.add_lightning_class_args(LastCheckpoint, "last_checkpoint")
 
 
 def main():

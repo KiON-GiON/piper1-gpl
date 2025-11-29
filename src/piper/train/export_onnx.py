@@ -8,10 +8,20 @@ from typing import Optional
 import torch
 
 from .vits.lightning import VitsModel
+from torch.nn.utils import remove_weight_norm 
 
 _LOGGER = logging.getLogger(__name__)
 OPSET_VERSION = 15
 
+
+def recursive_remove_weight_norm(module):
+    try:
+        remove_weight_norm(module)
+    except ValueError:
+        pass
+
+    for child in module.children():
+        recursive_remove_weight_norm(child)
 
 def main() -> None:
     """Main entry point"""
@@ -52,7 +62,9 @@ def main() -> None:
     model_g.eval()
 
     with torch.no_grad():
-        model_g.dec.remove_weight_norm()
+        if hasattr(model_g.dec, "remove_weight_norm"):
+            model_g.dec.remove_weight_norm()
+        recursive_remove_weight_norm(model_g)
 
     def infer_forward(text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
@@ -65,7 +77,7 @@ def main() -> None:
             length_scale=length_scale,
             noise_scale_w=noise_scale_w,
             sid=sid,
-        )[0].unsqueeze(1)
+        )[0]
 
         return audio
 
@@ -80,13 +92,26 @@ def main() -> None:
     )
     sequence_lengths = torch.LongTensor([sequences.size(1)])
 
-    sid: Optional[torch.LongTensor] = None
-    if num_speakers > 1:
-        sid = torch.LongTensor([0])
-
     # noise, length, noise_w
     scales = torch.FloatTensor([0.667, 1.0, 0.8])
-    dummy_input = (sequences, sequence_lengths, scales, sid)
+
+    input_names = ["input", "input_lengths", "scales"]
+    output_names = ["output"]
+    
+    dynamic_axes = {
+        "input": {0: "batch_size", 1: "phonemes"},
+        "input_lengths": {0: "batch_size"},
+        "output": {0: "batch_size", 2: "time"},
+    }
+
+    sid: Optional[torch.LongTensor] = None
+    dummy_input = (sequences, sequence_lengths, scales)
+
+    if num_speakers > 1:
+        sid = torch.LongTensor([0])
+        dummy_input = (sequences, sequence_lengths, scales, sid)
+        input_names.append("sid")
+        dynamic_axes["sid"] = {0: "batch_size"}
 
     # Export
     torch.onnx.export(
@@ -95,13 +120,10 @@ def main() -> None:
         f=output_path,
         verbose=False,
         opset_version=OPSET_VERSION,
-        input_names=["input", "input_lengths", "scales", "sid"],
-        output_names=["output"],
-        dynamic_axes={
-            "input": {0: "batch_size", 1: "phonemes"},
-            "input_lengths": {0: "batch_size"},
-            "output": {0: "batch_size", 2: "time"},
-        },
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        dynamo=False,
     )
     _LOGGER.info("Exported model to %s", output_path)
 

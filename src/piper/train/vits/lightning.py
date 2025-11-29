@@ -1,4 +1,7 @@
 """PyTorch Lightning module."""
+import os
+import numpy as np
+from scipy.io.wavfile import write as write_wav
 
 import ast
 import logging
@@ -71,6 +74,7 @@ class VitsModel(L.LightningModule):
         c_mel: int = 45,
         c_kl: float = 1.0,
         grad_clip: Optional[float] = None,
+        init_from_checkpoint: Optional[str] = None,
         # unused
         dataset: object = None,
         **kwargs,
@@ -102,6 +106,8 @@ class VitsModel(L.LightningModule):
         expected_hop_length = reduce(operator.mul, self.hparams.upsample_rates, 1)
         if expected_hop_length != hop_length:
             raise ValueError("Upsample rates do not match hop length")
+
+        self.hparams.resblock = str(self.hparams.resblock)
 
         # Need to use manual optimization because we have multiple optimizers
         self.automatic_optimization = False
@@ -137,6 +143,101 @@ class VitsModel(L.LightningModule):
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
+
+        if init_from_checkpoint:
+            self._load_generator_weights(init_from_checkpoint)
+            self.hparams.init_from_checkpoint = None
+
+    def _load_generator_weights(self, ckpt_path: str):
+
+        if not os.path.isfile(ckpt_path):
+            _LOGGER.warning(
+                "init_from_checkpoint: file not found (%s), weight loading is omitted",
+                ckpt_path,
+            )
+            return
+
+        _LOGGER.info("init_from_checkpoint: loading weights from %s", ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        if "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+        elif "model" in ckpt:
+            state = ckpt["model"]
+        else:
+            state = ckpt
+
+        model_state = self.model_g.state_dict()
+
+        ckpt_has_speaker_emb = any(
+            "emb_g" in k for k in state.keys()
+        )
+        model_is_multispeaker = self.hparams.num_speakers > 1
+
+        transferred = []
+        skipped_missing = []
+        skipped_speaker_cond = []
+        skipped_shape = []
+
+        speaker_cond_patterns = (
+            "emb_g",
+            "dec.cond",
+            "dp.cond", 
+            "cond_layer",
+        )
+
+        for full_name, param in state.items():
+            name = full_name
+            for prefix in ["model_g.", "module.", "net_g."]:
+                if name.startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+
+            if any(pattern in name for pattern in speaker_cond_patterns):
+                if not ckpt_has_speaker_emb and model_is_multispeaker:
+                    skipped_speaker_cond.append(name)
+                    continue
+                
+                if name in model_state and model_state[name].shape != param.shape:
+                    skipped_speaker_cond.append(name)
+                    continue
+
+            if name not in model_state:
+                skipped_missing.append(name)
+                continue
+
+            if model_state[name].shape != param.shape:
+                skipped_shape.append((name, param.shape, model_state[name].shape))
+                continue
+
+            transferred.append(name)
+            model_state[name] = param
+
+        self.model_g.load_state_dict(model_state, strict=False)
+
+        _LOGGER.info("init_from_checkpoint: %d transfered parameters", len(transferred))
+
+        if skipped_speaker_cond:
+            _LOGGER.info(
+                "init_from_checkpoint: %d speaker conditioning parameters omitted "
+                "(single→multi speaker or different number of speakers): %s",
+                len(skipped_speaker_cond),
+                skipped_speaker_cond,
+            )
+        
+        if skipped_missing:
+            _LOGGER.debug(
+                "init_from_checkpoint: %d parameters not found in destination model: %s",
+                len(skipped_missing),
+                skipped_missing[:10]  # Only show first 10
+            )
+        
+        if skipped_shape:
+            _LOGGER.info("init_from_checkpoint: parameters omitted due to incompatible shape:")
+            for name, src_shape, dst_shape in skipped_shape[:10]:
+                _LOGGER.info("  %s: origin=%s, destination=%s", name, src_shape, dst_shape)
+            if len(skipped_shape) > 10:
+                _LOGGER.info("  ... and %d more", len(skipped_shape) - 10)
 
     def forward(self, text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
@@ -251,36 +352,67 @@ class VitsModel(L.LightningModule):
         return val_loss
 
     def on_validation_end(self) -> None:
-        # Generate audio examples after validation, but not during sanity check
         if self.trainer.sanity_checking:
             return super().on_validation_end()
 
-        if (
-            getattr(self, "logger", None)
-            and hasattr(self.logger, "experiment")
-            and hasattr(self.logger.experiment, "add_audio")
-        ):
-            # Generate audio examples
-            # Requires tensorboard
-            for utt_idx, test_utt in enumerate(self.trainer.datamodule.test_dataset):
-                text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
-                text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(
-                    self.device
-                )
-                scales = [0.667, 1.0, 0.8]
-                sid = (
-                    test_utt.speaker_id.to(self.device)
-                    if test_utt.speaker_id is not None
-                    else None
-                )
-                test_audio = self(text, text_lengths, scales, sid=sid).detach()
+        output_dir = os.path.join(self.trainer.default_root_dir, "val_samples")
+        os.makedirs(output_dir, exist_ok=True)
 
-                # Scale to make louder in [-1, 1]
-                test_audio = test_audio * (1.0 / max(0.01, abs(test_audio).max()))
+        dataset = getattr(self.trainer.datamodule, "test_dataset", None)
+        if dataset is None:
+            return super().on_validation_end()
 
+        logger = getattr(self, "logger", None)
+        has_tb_audio = (
+            logger is not None
+            and hasattr(logger, "experiment")
+            and hasattr(logger.experiment, "add_audio")
+        )
+        
+        for utt_idx, test_utt in enumerate(dataset):
+            text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
+            text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(self.device)
+            scales = [0.667, 1.0, 0.8]
+            sid = (
+                test_utt.speaker_id.to(self.device)
+                if test_utt.speaker_id is not None
+                else None
+            )
+
+            with torch.no_grad():
+                audio, *_ = self.model_g.infer(
+                    text,
+                    text_lengths,
+                    noise_scale=scales[0],
+                    length_scale=scales[1],
+                    noise_scale_w=scales[2],
+                    sid=sid,
+                    max_len=2000 
+                )
+
+            audio = audio.squeeze()
+            audio_np = audio.squeeze().cpu().numpy()
+
+            max_val = np.abs(audio_np).max()
+            if max_val > 0.9:
+                audio_np = audio_np / max_val * 0.9
+            
+            audio_int16 = (audio_np * 32767).astype(np.int16)
+
+            filename = f"sample_{utt_idx}.wav"
+            filepath = os.path.join(output_dir, filename)
+
+            write_wav(filepath, self.hparams.sample_rate, audio_int16)
+
+            if has_tb_audio:
+                audio_tb = torch.from_numpy(audio_np).unsqueeze(0)  # [1, T]
                 tag = test_utt.text or str(utt_idx)
-                self.logger.experiment.add_audio(
-                    tag, test_audio, sample_rate=self.hparams.sample_rate
+
+                logger.experiment.add_audio(
+                    tag=tag,
+                    snd_tensor=audio_tb,
+                    sample_rate=self.hparams.sample_rate,
+                    global_step=self.global_step,
                 )
 
         return super().on_validation_end()
