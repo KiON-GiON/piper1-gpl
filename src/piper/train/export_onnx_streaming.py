@@ -125,7 +125,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = VitsModel.load_from_checkpoint(
-        checkpoint_path, map_location="cpu"
+        checkpoint_path, map_location="cpu", weights_only=False
     )
     model_g = model.model_g
     model_g.eval()
