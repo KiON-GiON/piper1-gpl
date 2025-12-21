@@ -7,7 +7,8 @@ import ast
 import logging
 import operator
 from functools import reduce
-from typing import Optional
++from dataclasses import dataclass
++from typing import Optional, Any, Tuple
 
 import lightning as L
 import torch
@@ -16,11 +17,36 @@ from torch.nn import functional as F
 
 from .commons import slice_segments
 from .dataset import Batch
-from .losses import discriminator_loss, feature_loss, generator_loss, kl_loss
+from .losses import (
+    discriminator_loss,
+    feature_loss,
+    generator_loss,
+    kl_loss,
+    masked_discriminator_loss,
+    masked_generator_loss,
+)
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from .models import MultiPeriodDiscriminator, SynthesizerTrn
+from .models_vits2 import SynthesizerTrnVits2
+from .duration_discriminators import build_duration_discriminator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class _ForwardPack:
+    y: torch.Tensor
+    y_hat: torch.Tensor
+    y_mel: torch.Tensor
+    y_hat_mel: torch.Tensor
+    x_mask: torch.Tensor
+    z_mask: torch.Tensor
+    l_length: torch.Tensor
+    z_p: torch.Tensor
+    m_p: torch.Tensor
+    logs_p: torch.Tensor
+    logs_q: torch.Tensor
+    extra: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
 class VitsModel(L.LightningModule):
@@ -61,6 +87,19 @@ class VitsModel(L.LightningModule):
         gin_channels: int = 0,
         use_sdp: bool = True,
         segment_size: int = 8192,
+        # VITS2
+        use_vits2: bool = False,
+        vits2_use_spk_conditioned_encoder: bool = False,
+        vits2_cond_layer_idx: int = 2,
+        vits2_use_transformer_flows: bool = False,
+        vits2_transformer_flow_type: str = "mono_layer_post_residual",
+        vits2_use_noise_scaled_mas: bool = False,
+        vits2_mas_noise_scale_initial: float = 0.01,
+        vits2_noise_scale_delta: float = 2e-6,
+        use_mel_posterior_encoder: bool = False,
+        use_duration_discriminator: bool = False,
+        duration_discriminator_type: str = "dur_disc_2",
+        log_vits2_features: bool = True,
         # training
         learning_rate: float = 2e-4,
         learning_rate_d: float = 1e-4,
@@ -119,9 +158,31 @@ class VitsModel(L.LightningModule):
             self.hparams.gin_channels = 512
 
         # Set up models
-        self.model_g = SynthesizerTrn(
+        SynthClass = SynthesizerTrnVits2 if self.hparams.use_vits2 else SynthesizerTrn
+
+        spec_channels = self.hparams.mel_channels if self.hparams.use_mel_posterior_encoder else (self.hparams.filter_length // 2 + 1)
+
+        if self.hparams.log_vits2_features:
+            _LOGGER.info("Generator: %s", SynthClass.__name__)
+            _LOGGER.info("use_mel_posterior_encoder=%s (spec_channels=%s)", self.hparams.use_mel_posterior_encoder, spec_channels)
+            if self.hparams.use_vits2:
+                _LOGGER.info(
+                    "VITS2 flags: spk_cond_enc=%s (idx=%s), transformer_flows=%s (type=%s), "
+                    "noise_scaled_mas=%s (init=%s, delta=%s), dur_disc=%s (type=%s)",
+                    self.hparams.vits2_use_spk_conditioned_encoder,
+                    self.hparams.vits2_cond_layer_idx,
+                    self.hparams.vits2_use_transformer_flows,
+                    self.hparams.vits2_transformer_flow_type,
+                    self.hparams.vits2_use_noise_scaled_mas,
+                    self.hparams.vits2_mas_noise_scale_initial,
+                    self.hparams.vits2_noise_scale_delta,
+                    self.hparams.use_duration_discriminator,
+                    self.hparams.duration_discriminator_type,
+                )
+
+        self.model_g = SynthClass(
             n_vocab=num_symbols,
-            spec_channels=self.hparams.filter_length // 2 + 1,
+            spec_channels=spec_channels,
             segment_size=self.hparams.segment_size // self.hparams.hop_length,
             inter_channels=self.hparams.inter_channels,
             hidden_channels=self.hparams.hidden_channels,
@@ -139,10 +200,26 @@ class VitsModel(L.LightningModule):
             n_speakers=self.hparams.num_speakers,
             gin_channels=self.hparams.gin_channels,
             use_sdp=self.hparams.use_sdp,
+            # VITS2 extras
+            vits2_use_spk_conditioned_encoder=self.hparams.vits2_use_spk_conditioned_encoder,
+            vits2_cond_layer_idx=self.hparams.vits2_cond_layer_idx,
+            vits2_use_transformer_flows=self.hparams.vits2_use_transformer_flows,
+            vits2_transformer_flow_type=self.hparams.vits2_transformer_flow_type,
+            vits2_use_noise_scaled_mas=self.hparams.vits2_use_noise_scaled_mas,
+            vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
+            vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
         )
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
+
+        self.model_dur = None
+        if self.hparams.use_duration_discriminator:
+            self.model_dur = build_duration_discriminator(
+                self.hparams.duration_discriminator_type,
+                hidden_channels=self.hparams.hidden_channels,
+                gin_channels=0,
+            )
 
         if init_from_checkpoint:
             self._load_generator_weights(init_from_checkpoint)
@@ -254,8 +331,13 @@ class VitsModel(L.LightningModule):
 
         return audio
 
-    def _compute_loss(self, batch: Batch):
-        # g step
+    def _set_requires_grad(self, module: Optional[torch.nn.Module], flag: bool) -> None:
+        if module is None:
+            return
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def _forward_g_and_prepare(self, batch: Batch) -> _ForwardPack:
         x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
             batch.phoneme_ids,
             batch.phoneme_lengths,
@@ -265,29 +347,57 @@ class VitsModel(L.LightningModule):
             batch.spectrogram_lengths,
             batch.speaker_ids if batch.speaker_ids is not None else None,
         )
-        (
-            y_hat,
-            l_length,
-            _attn,
-            ids_slice,
-            _x_mask,
-            z_mask,
-            (_z, z_p, m_p, logs_p, _m_q, logs_q),
-        ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
 
-        mel = spec_to_mel_torch(
-            spec,
-            self.hparams.filter_length,
-            self.hparams.mel_channels,
-            self.hparams.sample_rate,
-            self.hparams.mel_fmin,
-            self.hparams.mel_fmax,
-        )
-        y_mel = slice_segments(
-            mel,
-            ids_slice,
-            self.hparams.segment_size // self.hparams.hop_length,
-        )
+        if getattr(self.hparams, "use_mel_posterior_encoder", False):
+            y_in = spec_to_mel_torch(
+                spec,
+                self.hparams.filter_length,
+                self.hparams.mel_channels,
+                self.hparams.sample_rate,
+                self.hparams.mel_fmin,
+                self.hparams.mel_fmax,
+            )
+            mel_gt = y_in
+        else:
+            y_in = spec
+            mel_gt = spec_to_mel_torch(
+                spec,
+                self.hparams.filter_length,
+                self.hparams.mel_channels,
+                self.hparams.sample_rate,
+                self.hparams.mel_fmin,
+                self.hparams.mel_fmax,
+            )
+
+        out = self.model_g(x, x_lengths, y_in, spec_lengths, speaker_ids)
+
+        extra = None
+        if isinstance(out, (tuple, list)) and (len(out) == 8):
+            (
+                y_hat,
+                l_length,
+                _attn,
+                ids_slice,
+                x_mask,
+                z_mask,
+                (_z, z_p, m_p, logs_p, _m_q, logs_q),
+                extra,
+            ) = out
+        else:
+            (
+                y_hat,
+                l_length,
+                _attn,
+                ids_slice,
+                x_mask,
+                z_mask,
+                (_z, z_p, m_p, logs_p, _m_q, logs_q),
+            ) = out
+
+        seg_frames = self.hparams.segment_size // self.hparams.hop_length
+        y_mel = slice_segments(mel_gt, ids_slice, seg_frames)
+        y_slice = slice_segments(y, ids_slice * self.hparams.hop_length, self.hparams.segment_size)
+
         y_hat_mel = mel_spectrogram_torch(
             y_hat.squeeze(1),
             self.hparams.filter_length,
@@ -298,56 +408,136 @@ class VitsModel(L.LightningModule):
             self.hparams.mel_fmin,
             self.hparams.mel_fmax,
         )
-        y = slice_segments(
-            y,
-            ids_slice * self.hparams.hop_length,
-            self.hparams.segment_size,
-        )  # slice
 
-        # Trim to avoid padding issues
-        y_hat = y_hat[..., : y.shape[-1]]
+        y_hat = y_hat[..., : y_slice.shape[-1]]
 
-        _y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
+        if extra is not None:
+            try:
+                hidden_x, logw, logw_ = extra
+                extra = (hidden_x, logw, logw_)
+            except Exception:
+                extra = None
 
-        with autocast(self.device.type, enabled=False):
-            # Generator loss
-            loss_dur = torch.sum(l_length.float())
-            loss_mel = F.l1_loss(y_mel, y_hat_mel) * self.hparams.c_mel
-            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * self.hparams.c_kl
+        return _ForwardPack(
+            y=y_slice,
+            y_hat=y_hat,
+            y_mel=y_mel,
+            y_hat_mel=y_hat_mel,
+            x_mask=x_mask,
+            z_mask=z_mask,
+            l_length=l_length,
+            z_p=z_p,
+            m_p=m_p,
+            logs_p=logs_p,
+            logs_q=logs_q,
+            extra=extra,
+        )
 
-            loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen, _losses_gen = generator_loss(y_d_hat_g)
-            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-
-        # d step
+    def _loss_d_audio(self, y: torch.Tensor, y_hat: torch.Tensor) -> torch.Tensor:
         y_d_hat_r, y_d_hat_g, _, _ = self.model_d(y, y_hat.detach())
-
         with autocast(self.device.type, enabled=False):
-            # Discriminator
-            loss_disc, _losses_disc_r, _losses_disc_g = discriminator_loss(
-                y_d_hat_r, y_d_hat_g
-            )
-            loss_disc_all = loss_disc
+            loss_d, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
+        return loss_d
 
-        return loss_gen_all, loss_disc_all
+    def _loss_g_audio_adv_fm(self, y: torch.Tensor, y_hat: torch.Tensor) -> torch.Tensor:
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
+        with autocast(self.device.type, enabled=False):
+            loss_fm = feature_loss(fmap_r, fmap_g)
+            loss_adv, _ = generator_loss(y_d_hat_g)
+        return loss_adv + loss_fm
+
+    def _loss_g_fixed_terms(self, pack: _ForwardPack) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        with autocast(self.device.type, enabled=False):
+            loss_dur = torch.sum(pack.l_length.float())
+            loss_mel = F.l1_loss(pack.y_mel, pack.y_hat_mel) * self.hparams.c_mel
+            loss_kl = kl_loss(pack.z_p, pack.logs_q, pack.m_p, pack.logs_p, pack.z_mask) * self.hparams.c_kl
+            loss_fixed = loss_mel + loss_dur + loss_kl
+        return loss_fixed, loss_mel, loss_dur, loss_kl
+
+    def _loss_d_dur(self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor) -> torch.Tensor:
+        hidden_x, logw, logw_ = extra
+        y_dur_r, y_dur_g = self.model_dur(
+            hidden_x.detach(),
+            x_mask.detach(),
+            logw_.detach(),
+            logw.detach(),
+        )
+        with autocast(self.device.type, enabled=False):
+            loss_dur_disc, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask)
+        return loss_dur_disc
+
+    def _loss_g_dur(self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor) -> torch.Tensor:
+        hidden_x, logw, logw_ = extra
+        _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw)
+        with autocast(self.device.type, enabled=False):
+            loss_dur_gen, _ = masked_generator_loss(y_dur_g2, x_mask)
+        return loss_dur_gen
 
     def training_step(self, batch: Batch, batch_idx: int):
-        opt_g, opt_d = self.optimizers()
-        loss_g, loss_d = self._compute_loss(batch)
+        opts = self.optimizers()
+        opt_g = opts[0]
+        opt_d = opts[1]
+        opt_dur = opts[2] if (len(opts) > 2) else None
 
-        self.log("loss_g", loss_g, batch_size=self.batch_size)
-        opt_g.zero_grad()
-        self.manual_backward(loss_g, retain_graph=True)
-        opt_g.step()
+        if getattr(self.hparams, "use_vits2", False) and getattr(self.hparams, "vits2_use_noise_scaled_mas", False):
+            if hasattr(self.model_g, "current_mas_noise_scale") and hasattr(self.model_g, "mas_noise_scale_initial") and hasattr(self.model_g, "noise_scale_delta"):
+                cur = float(self.model_g.mas_noise_scale_initial) - float(self.model_g.noise_scale_delta) * float(self.global_step)
+                self.model_g.current_mas_noise_scale = max(cur, 0.0)
 
-        self.log("loss_d", loss_d, batch_size=self.batch_size)
-        opt_d.zero_grad()
+        pack = self._forward_g_and_prepare(batch)
+
+        self._set_requires_grad(self.model_d, True)
+        opt_d.zero_grad(set_to_none=True)
+        loss_d = self._loss_d_audio(pack.y, pack.y_hat)
         self.manual_backward(loss_d)
         opt_d.step()
+        self.log("loss_d", loss_d, batch_size=self.batch_size)
+
+        loss_dur_disc = None
+        if (opt_dur is not None) and (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
+            self._set_requires_grad(self.model_dur, True)
+            opt_dur.zero_grad(set_to_none=True)
+            loss_dur_disc = self._loss_d_dur(pack.extra, pack.x_mask)
+            self.manual_backward(loss_dur_disc)
+            opt_dur.step()
+            self.log("loss_dur_disc", loss_dur_disc, batch_size=self.batch_size)
+
+        self._set_requires_grad(self.model_d, False)
+        if getattr(self, "model_dur", None) is not None:
+            self._set_requires_grad(self.model_dur, False)
+
+        opt_g.zero_grad(set_to_none=True)
+
+        loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
+        loss_fixed, loss_mel, loss_dur, loss_kl = self._loss_g_fixed_terms(pack)
+        loss_g = loss_adv_fm + loss_fixed
+
+        if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
+            loss_g = loss_g + self._loss_g_dur(pack.extra, pack.x_mask)
+
+        self.manual_backward(loss_g)
+        opt_g.step()
+
+        self.log("loss_g", loss_g, batch_size=self.batch_size)
+        self.log("loss_mel", loss_mel, batch_size=self.batch_size)
+        self.log("loss_dur", loss_dur, batch_size=self.batch_size)
+        self.log("loss_kl", loss_kl, batch_size=self.batch_size)
+
+        self._set_requires_grad(self.model_d, True)
+        if getattr(self, "model_dur", None) is not None:
+            self._set_requires_grad(self.model_dur, True)
 
     def validation_step(self, batch: Batch, batch_idx: int):
-        loss_g, _loss_d = self._compute_loss(batch)
-        val_loss = loss_g  # only generator loss matters
+        pack = self._forward_g_and_prepare(batch)
+
+        with torch.no_grad():
+            loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
+            loss_fixed, _loss_mel, _loss_dur, _loss_kl = self._loss_g_fixed_terms(pack)
+            val_loss = loss_adv_fm + loss_fixed
+
+            if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
+                val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask)
+
         self.log("val_loss", val_loss, batch_size=self.batch_size)
         return val_loss
 
@@ -418,27 +608,18 @@ class VitsModel(L.LightningModule):
         return super().on_validation_end()
 
     def configure_optimizers(self):
-        optimizers = [
-            torch.optim.AdamW(
-                self.model_g.parameters(),
-                lr=self.hparams.learning_rate,
-                betas=self.hparams.betas,
-                eps=self.hparams.eps,
-            ),
-            torch.optim.AdamW(
-                self.model_d.parameters(),
-                lr=self.hparams.learning_rate_d,
-                betas=self.hparams.betas_d,
-                eps=self.hparams.eps,
-            ),
-        ]
+        optim_g = torch.optim.AdamW(self.model_g.parameters(), lr=self.hparams.learning_rate, betas=self.hparams.betas, eps=self.hparams.eps)
+        optim_d = torch.optim.AdamW(self.model_d.parameters(), lr=self.hparams.learning_rate_d, betas=self.hparams.betas_d, eps=self.hparams.eps)
+
+        optimizers = [optim_g, optim_d]
         schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[0], gamma=self.hparams.lr_decay
-            ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[1], gamma=self.hparams.lr_decay_d
-            ),
+            torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=self.hparams.lr_decay),
+            torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=self.hparams.lr_decay_d),
         ]
+
+        if self.model_dur is not None:
+            optim_dur = torch.optim.AdamW(self.model_dur.parameters(), lr=self.hparams.learning_rate_d, betas=self.hparams.betas_d, eps=self.hparams.eps)
+            optimizers.append(optim_dur)
+            schedulers.append(torch.optim.lr_scheduler.ExponentialLR(optim_dur, gamma=self.hparams.lr_decay_d))
 
         return optimizers, schedulers

@@ -76,6 +76,16 @@ class ModelConfig:
     gin_channels: int = 0  # single speaker
     use_sdp: bool = True  # StochasticDurationPredictor
     segment_size: int = 8192
+    # VITS2
+    use_vits2: bool = False
+    vits2_use_spk_conditioned_encoder: bool = False
+    vits2_cond_layer_idx: int = 2
+    vits2_use_transformer_flows: bool = False
+    vits2_transformer_flow_type: str = "mono_layer_post_residual"
+    vits2_use_noise_scaled_mas: bool = False
+    vits2_mas_noise_scale_initial: float = 0.01
+    vits2_noise_scale_delta: float = 2e-6
+    log_vits2_features: bool = True
 
     @property
     def is_multispeaker(self) -> bool:
