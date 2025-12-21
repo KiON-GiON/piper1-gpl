@@ -7,7 +7,8 @@ import ast
 import logging
 import operator
 from functools import reduce
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import lightning as L
 import torch
@@ -22,6 +23,19 @@ from .models import MultiPeriodDiscriminator, SynthesizerTrn
 
 _LOGGER = logging.getLogger(__name__)
 
+
+@dataclass
+class _ForwardPack:
+    y: torch.Tensor
+    y_hat: torch.Tensor
+    y_mel: torch.Tensor
+    y_hat_mel: torch.Tensor
+    l_length: torch.Tensor
+    z_mask: torch.Tensor
+    z_p: torch.Tensor
+    m_p: torch.Tensor
+    logs_p: torch.Tensor
+    logs_q: torch.Tensor
 
 class VitsModel(L.LightningModule):
     def __init__(
@@ -254,8 +268,13 @@ class VitsModel(L.LightningModule):
 
         return audio
 
-    def _compute_loss(self, batch: Batch):
-        # g step
+    def _set_requires_grad(self, module: Optional[torch.nn.Module], flag: bool) -> None:
+        if module is None:
+            return
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def _forward_g_and_prepare(self, batch: Batch) -> _ForwardPack:
         x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
             batch.phoneme_ids,
             batch.phoneme_lengths,
@@ -288,6 +307,15 @@ class VitsModel(L.LightningModule):
             ids_slice,
             self.hparams.segment_size // self.hparams.hop_length,
         )
+        y = slice_segments(
+            y,
+            ids_slice * self.hparams.hop_length,
+            self.hparams.segment_size,
+        )  # slice
+
+        # Trim to avoid padding issues
+        y_hat = y_hat[..., : y.shape[-1]]
+
         y_hat_mel = mel_spectrogram_torch(
             y_hat.squeeze(1),
             self.hparams.filter_length,
@@ -298,56 +326,79 @@ class VitsModel(L.LightningModule):
             self.hparams.mel_fmin,
             self.hparams.mel_fmax,
         )
-        y = slice_segments(
-            y,
-            ids_slice * self.hparams.hop_length,
-            self.hparams.segment_size,
-        )  # slice
 
-        # Trim to avoid padding issues
-        y_hat = y_hat[..., : y.shape[-1]]
+        return _ForwardPack(
+            y=y,
+            y_hat=y_hat,
+            y_mel=y_mel,
+            y_hat_mel=y_hat_mel,
+            l_length=l_length,
+            z_mask=z_mask,
+            z_p=z_p,
+            m_p=m_p,
+            logs_p=logs_p,
+            logs_q=logs_q,
+        )
 
-        _y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
-
-        with autocast(self.device.type, enabled=False):
-            # Generator loss
-            loss_dur = torch.sum(l_length.float())
-            loss_mel = F.l1_loss(y_mel, y_hat_mel) * self.hparams.c_mel
-            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * self.hparams.c_kl
-
-            loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen, _losses_gen = generator_loss(y_d_hat_g)
-            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-
-        # d step
+    def _loss_d_audio(self, y: torch.Tensor, y_hat: torch.Tensor) -> torch.Tensor:
         y_d_hat_r, y_d_hat_g, _, _ = self.model_d(y, y_hat.detach())
-
         with autocast(self.device.type, enabled=False):
-            # Discriminator
-            loss_disc, _losses_disc_r, _losses_disc_g = discriminator_loss(
-                y_d_hat_r, y_d_hat_g
-            )
-            loss_disc_all = loss_disc
+            loss_d, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
+        return loss_d
 
-        return loss_gen_all, loss_disc_all
+    def _loss_g_audio_adv_fm(self, y: torch.Tensor, y_hat: torch.Tensor) -> torch.Tensor:
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
+        with autocast(self.device.type, enabled=False):
+            loss_fm = feature_loss(fmap_r, fmap_g)
+            loss_adv, _ = generator_loss(y_d_hat_g)
+        return loss_adv + loss_fm
+
+    def _loss_g_fixed_terms(
+        self, pack: _ForwardPack
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        with autocast(self.device.type, enabled=False):
+            loss_dur = torch.sum(pack.l_length.float())
+            loss_mel = F.l1_loss(pack.y_mel, pack.y_hat_mel) * self.hparams.c_mel
+            loss_kl = kl_loss(pack.z_p, pack.logs_q, pack.m_p, pack.logs_p, pack.z_mask) * self.hparams.c_kl
+            loss_fixed = loss_mel + loss_dur + loss_kl
+        return loss_fixed, loss_mel, loss_dur, loss_kl
 
     def training_step(self, batch: Batch, batch_idx: int):
         opt_g, opt_d = self.optimizers()
-        loss_g, loss_d = self._compute_loss(batch)
+        pack = self._forward_g_and_prepare(batch)
 
-        self.log("loss_g", loss_g, batch_size=self.batch_size)
-        opt_g.zero_grad()
-        self.manual_backward(loss_g, retain_graph=True)
-        opt_g.step()
-
-        self.log("loss_d", loss_d, batch_size=self.batch_size)
-        opt_d.zero_grad()
+        self._set_requires_grad(self.model_d, True)
+        opt_d.zero_grad(set_to_none=True)
+        loss_d = self._loss_d_audio(pack.y, pack.y_hat)
         self.manual_backward(loss_d)
         opt_d.step()
+        self.log("loss_d", loss_d, batch_size=self.batch_size)
+
+        self._set_requires_grad(self.model_d, False)
+        opt_g.zero_grad(set_to_none=True)
+
+        loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
+        loss_fixed, loss_mel, loss_dur, loss_kl = self._loss_g_fixed_terms(pack)
+        loss_g = loss_adv_fm + loss_fixed
+
+        self.log("loss_g", loss_g, batch_size=self.batch_size)
+        self.log("loss_mel", loss_mel, batch_size=self.batch_size)
+        self.log("loss_dur", loss_dur, batch_size=self.batch_size)
+        self.log("loss_kl", loss_kl, batch_size=self.batch_size)
+
+        self.manual_backward(loss_g)
+        opt_g.step()
+
+        self._set_requires_grad(self.model_d, True)
 
     def validation_step(self, batch: Batch, batch_idx: int):
-        loss_g, _loss_d = self._compute_loss(batch)
-        val_loss = loss_g  # only generator loss matters
+        pack = self._forward_g_and_prepare(batch)
+        with torch.no_grad():
+            self._set_requires_grad(self.model_d, False)
+            loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
+            loss_fixed, _, _, _ = self._loss_g_fixed_terms(pack)
+            val_loss = loss_adv_fm + loss_fixed
+            self._set_requires_grad(self.model_d, True)
         self.log("val_loss", val_loss, batch_size=self.batch_size)
         return val_loss
 
