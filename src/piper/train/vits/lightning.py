@@ -142,6 +142,9 @@ class VitsModel(L.LightningModule):
         if isinstance(self.hparams.betas, str):
             self.hparams.betas = ast.literal_eval(self.hparams.betas)
 
+        if isinstance(self.hparams.betas_d, str):
+            self.hparams.betas_d = ast.literal_eval(self.hparams.betas_d)
+
         expected_hop_length = reduce(operator.mul, self.hparams.upsample_rates, 1)
         if expected_hop_length != hop_length:
             raise ValueError("Upsample rates do not match hop length")
@@ -152,19 +155,32 @@ class VitsModel(L.LightningModule):
         self.automatic_optimization = False
 
         self.batch_size = batch_size
+        self._mas_batch_step = 0  # batch-based counter, not optimizer-step-based
 
         if (self.hparams.num_speakers > 1) and (self.hparams.gin_channels <= 0):
-            # Default gin_channels for multi-speaker model
             self.hparams.gin_channels = 512
 
-        # Set up models
+        if self.hparams.use_duration_discriminator and not self.hparams.use_vits2:
+            _LOGGER.warning(
+                "use_duration_discriminator=True ignored because use_vits2=False"
+            )
+            self.hparams.use_duration_discriminator = False
+
         SynthClass = SynthesizerTrnVits2 if self.hparams.use_vits2 else SynthesizerTrn
 
-        spec_channels = self.hparams.mel_channels if self.hparams.use_mel_posterior_encoder else (self.hparams.filter_length // 2 + 1)
+        spec_channels = (
+            self.hparams.mel_channels
+            if self.hparams.use_mel_posterior_encoder
+            else (self.hparams.filter_length // 2 + 1)
+        )
 
         if self.hparams.log_vits2_features:
             _LOGGER.info("Generator: %s", SynthClass.__name__)
-            _LOGGER.info("use_mel_posterior_encoder=%s (spec_channels=%s)", self.hparams.use_mel_posterior_encoder, spec_channels)
+            _LOGGER.info(
+                "use_mel_posterior_encoder=%s (spec_channels=%s)",
+                self.hparams.use_mel_posterior_encoder,
+                spec_channels,
+            )
             if self.hparams.use_vits2:
                 _LOGGER.info(
                     "VITS2 flags: spk_cond_enc=%s (idx=%s), transformer_flows=%s (type=%s), "
@@ -180,7 +196,7 @@ class VitsModel(L.LightningModule):
                     self.hparams.duration_discriminator_type,
                 )
 
-        self.model_g = SynthClass(
+        model_g_kwargs = dict(
             n_vocab=num_symbols,
             spec_channels=spec_channels,
             segment_size=self.hparams.segment_size // self.hparams.hop_length,
@@ -200,15 +216,23 @@ class VitsModel(L.LightningModule):
             n_speakers=self.hparams.num_speakers,
             gin_channels=self.hparams.gin_channels,
             use_sdp=self.hparams.use_sdp,
-            # VITS2 extras
-            vits2_use_spk_conditioned_encoder=self.hparams.vits2_use_spk_conditioned_encoder,
-            vits2_cond_layer_idx=self.hparams.vits2_cond_layer_idx,
-            vits2_use_transformer_flows=self.hparams.vits2_use_transformer_flows,
-            vits2_transformer_flow_type=self.hparams.vits2_transformer_flow_type,
-            vits2_use_noise_scaled_mas=self.hparams.vits2_use_noise_scaled_mas,
-            vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
-            vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
         )
+
+        if self.hparams.use_vits2:
+            model_g_kwargs.update(
+                dict(
+                    vits2_use_spk_conditioned_encoder=self.hparams.vits2_use_spk_conditioned_encoder,
+                    vits2_cond_layer_idx=self.hparams.vits2_cond_layer_idx,
+                    vits2_use_transformer_flows=self.hparams.vits2_use_transformer_flows,
+                    vits2_transformer_flow_type=self.hparams.vits2_transformer_flow_type,
+                    vits2_use_noise_scaled_mas=self.hparams.vits2_use_noise_scaled_mas,
+                    vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
+                    vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
+                )
+            )
+
+        self.model_g = SynthClass(**model_g_kwargs)
+
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
@@ -224,6 +248,12 @@ class VitsModel(L.LightningModule):
         if init_from_checkpoint:
             self._load_generator_weights(init_from_checkpoint)
             self.hparams.init_from_checkpoint = None
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        checkpoint["mas_batch_step"] = int(self._mas_batch_step)
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        self._mas_batch_step = int(checkpoint.get("mas_batch_step", 0))
 
     def _load_generator_weights(self, ckpt_path: str):
 
@@ -246,9 +276,7 @@ class VitsModel(L.LightningModule):
 
         model_state = self.model_g.state_dict()
 
-        ckpt_has_speaker_emb = any(
-            "emb_g" in k for k in state.keys()
-        )
+        ckpt_has_speaker_emb = any("emb_g" in k for k in state.keys())
         model_is_multispeaker = self.hparams.num_speakers > 1
 
         transferred = []
@@ -259,7 +287,7 @@ class VitsModel(L.LightningModule):
         speaker_cond_patterns = (
             "emb_g",
             "dec.cond",
-            "dp.cond", 
+            "dp.cond",
             "cond_layer",
         )
 
@@ -274,7 +302,7 @@ class VitsModel(L.LightningModule):
                 if not ckpt_has_speaker_emb and model_is_multispeaker:
                     skipped_speaker_cond.append(name)
                     continue
-                
+
                 if name in model_state and model_state[name].shape != param.shape:
                     skipped_speaker_cond.append(name)
                     continue
@@ -292,7 +320,7 @@ class VitsModel(L.LightningModule):
 
         self.model_g.load_state_dict(model_state, strict=False)
 
-        _LOGGER.info("init_from_checkpoint: %d transfered parameters", len(transferred))
+        _LOGGER.info("init_from_checkpoint: %d transferred parameters", len(transferred))
 
         if skipped_speaker_cond:
             _LOGGER.info(
@@ -301,14 +329,14 @@ class VitsModel(L.LightningModule):
                 len(skipped_speaker_cond),
                 skipped_speaker_cond,
             )
-        
+
         if skipped_missing:
             _LOGGER.debug(
                 "init_from_checkpoint: %d parameters not found in destination model: %s",
                 len(skipped_missing),
-                skipped_missing[:10]  # Only show first 10
+                skipped_missing[:10],
             )
-        
+
         if skipped_shape:
             _LOGGER.info("init_from_checkpoint: parameters omitted due to incompatible shape:")
             for name, src_shape, dst_shape in skipped_shape[:10]:
@@ -328,7 +356,6 @@ class VitsModel(L.LightningModule):
             noise_scale_w=noise_scale_w,
             sid=sid,
         )
-
         return audio
 
     def _set_requires_grad(self, module: Optional[torch.nn.Module], flag: bool) -> None:
@@ -348,9 +375,11 @@ class VitsModel(L.LightningModule):
             batch.speaker_ids if batch.speaker_ids is not None else None,
         )
 
+        spec_f = spec.float()
+
         if getattr(self.hparams, "use_mel_posterior_encoder", False):
             y_in = spec_to_mel_torch(
-                spec,
+                spec_f,
                 self.hparams.filter_length,
                 self.hparams.mel_channels,
                 self.hparams.sample_rate,
@@ -361,7 +390,7 @@ class VitsModel(L.LightningModule):
         else:
             y_in = spec
             mel_gt = spec_to_mel_torch(
-                spec,
+                spec_f,
                 self.hparams.filter_length,
                 self.hparams.mel_channels,
                 self.hparams.sample_rate,
@@ -396,7 +425,9 @@ class VitsModel(L.LightningModule):
 
         seg_frames = self.hparams.segment_size // self.hparams.hop_length
         y_mel = slice_segments(mel_gt, ids_slice, seg_frames)
-        y_slice = slice_segments(y, ids_slice * self.hparams.hop_length, self.hparams.segment_size)
+        y_slice = slice_segments(
+            y, ids_slice * self.hparams.hop_length, self.hparams.segment_size
+        )
 
         y_hat_mel = mel_spectrogram_torch(
             y_hat.squeeze(1),
@@ -446,15 +477,22 @@ class VitsModel(L.LightningModule):
             loss_adv, _ = generator_loss(y_d_hat_g)
         return loss_adv + loss_fm
 
-    def _loss_g_fixed_terms(self, pack: _ForwardPack) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _loss_g_fixed_terms(
+        self, pack: _ForwardPack
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         with autocast(self.device.type, enabled=False):
             loss_dur = torch.sum(pack.l_length.float())
             loss_mel = F.l1_loss(pack.y_mel, pack.y_hat_mel) * self.hparams.c_mel
-            loss_kl = kl_loss(pack.z_p, pack.logs_q, pack.m_p, pack.logs_p, pack.z_mask) * self.hparams.c_kl
+            loss_kl = (
+                kl_loss(pack.z_p, pack.logs_q, pack.m_p, pack.logs_p, pack.z_mask)
+                * self.hparams.c_kl
+            )
             loss_fixed = loss_mel + loss_dur + loss_kl
         return loss_fixed, loss_mel, loss_dur, loss_kl
 
-    def _loss_d_dur(self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor) -> torch.Tensor:
+    def _loss_d_dur(
+        self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor
+    ) -> torch.Tensor:
         hidden_x, logw, logw_ = extra
         y_dur_r, y_dur_g = self.model_dur(
             hidden_x.detach(),
@@ -466,7 +504,9 @@ class VitsModel(L.LightningModule):
             loss_dur_disc, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask)
         return loss_dur_disc
 
-    def _loss_g_dur(self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor) -> torch.Tensor:
+    def _loss_g_dur(
+        self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor
+    ) -> torch.Tensor:
         hidden_x, logw, logw_ = extra
         _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw)
         with autocast(self.device.type, enabled=False):
@@ -475,13 +515,27 @@ class VitsModel(L.LightningModule):
 
     def training_step(self, batch: Batch, batch_idx: int):
         opts = self.optimizers()
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts]
+
         opt_g = opts[0]
         opt_d = opts[1]
         opt_dur = opts[2] if (len(opts) > 2) else None
 
-        if getattr(self.hparams, "use_vits2", False) and getattr(self.hparams, "vits2_use_noise_scaled_mas", False):
-            if hasattr(self.model_g, "current_mas_noise_scale") and hasattr(self.model_g, "mas_noise_scale_initial") and hasattr(self.model_g, "noise_scale_delta"):
-                cur = float(self.model_g.mas_noise_scale_initial) - float(self.model_g.noise_scale_delta) * float(self.global_step)
+        batch_size = int(batch.phoneme_ids.size(0))
+
+        if (
+            getattr(self.hparams, "use_vits2", False)
+            and getattr(self.hparams, "vits2_use_noise_scaled_mas", False)
+        ):
+            if (
+                hasattr(self.model_g, "current_mas_noise_scale")
+                and hasattr(self.model_g, "mas_noise_scale_initial")
+                and hasattr(self.model_g, "noise_scale_delta")
+            ):
+                cur = float(self.model_g.mas_noise_scale_initial) - (
+                    float(self.model_g.noise_scale_delta) * float(self._mas_batch_step)
+                )
                 self.model_g.current_mas_noise_scale = max(cur, 0.0)
 
         pack = self._forward_g_and_prepare(batch)
@@ -491,16 +545,20 @@ class VitsModel(L.LightningModule):
         loss_d = self._loss_d_audio(pack.y, pack.y_hat)
         self.manual_backward(loss_d)
         opt_d.step()
-        self.log("loss_d", loss_d, batch_size=self.batch_size)
+        self.log("loss_d", loss_d, batch_size=batch_size)
 
         loss_dur_disc = None
-        if (opt_dur is not None) and (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
+        if (
+            (opt_dur is not None)
+            and (getattr(self, "model_dur", None) is not None)
+            and (pack.extra is not None)
+        ):
             self._set_requires_grad(self.model_dur, True)
             opt_dur.zero_grad(set_to_none=True)
             loss_dur_disc = self._loss_d_dur(pack.extra, pack.x_mask)
             self.manual_backward(loss_dur_disc)
             opt_dur.step()
-            self.log("loss_dur_disc", loss_dur_disc, batch_size=self.batch_size)
+            self.log("loss_dur_disc", loss_dur_disc, batch_size=batch_size)
 
         self._set_requires_grad(self.model_d, False)
         if getattr(self, "model_dur", None) is not None:
@@ -518,17 +576,20 @@ class VitsModel(L.LightningModule):
         self.manual_backward(loss_g)
         opt_g.step()
 
-        self.log("loss_g", loss_g, batch_size=self.batch_size)
-        self.log("loss_mel", loss_mel, batch_size=self.batch_size)
-        self.log("loss_dur", loss_dur, batch_size=self.batch_size)
-        self.log("loss_kl", loss_kl, batch_size=self.batch_size)
+        self.log("loss_g", loss_g, batch_size=batch_size)
+        self.log("loss_mel", loss_mel, batch_size=batch_size)
+        self.log("loss_dur", loss_dur, batch_size=batch_size)
+        self.log("loss_kl", loss_kl, batch_size=batch_size)
 
         self._set_requires_grad(self.model_d, True)
         if getattr(self, "model_dur", None) is not None:
             self._set_requires_grad(self.model_dur, True)
 
+        self._mas_batch_step += 1
+
     def validation_step(self, batch: Batch, batch_idx: int):
         pack = self._forward_g_and_prepare(batch)
+        batch_size = int(batch.phoneme_ids.size(0))
 
         with torch.no_grad():
             loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
@@ -538,8 +599,20 @@ class VitsModel(L.LightningModule):
             if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
                 val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask)
 
-        self.log("val_loss", val_loss, batch_size=self.batch_size)
+        self.log("val_loss", val_loss, batch_size=batch_size)
         return val_loss
+
+    def on_train_epoch_end(self) -> None:
+        scheds = self.lr_schedulers()
+        if scheds is None:
+            return
+
+        if not isinstance(scheds, (list, tuple)):
+            scheds = [scheds]
+
+        for sch in scheds:
+            if sch is not None:
+                sch.step()
 
     def on_validation_end(self) -> None:
         if self.trainer.sanity_checking:
@@ -558,7 +631,7 @@ class VitsModel(L.LightningModule):
             and hasattr(logger, "experiment")
             and hasattr(logger.experiment, "add_audio")
         )
-        
+
         for utt_idx, test_utt in enumerate(dataset):
             text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
             text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(self.device)
@@ -568,6 +641,8 @@ class VitsModel(L.LightningModule):
                 if test_utt.speaker_id is not None
                 else None
             )
+            if sid is not None and sid.dim() == 0:
+                sid = sid.unsqueeze(0)
 
             with torch.no_grad():
                 audio, *_ = self.model_g.infer(
@@ -577,7 +652,7 @@ class VitsModel(L.LightningModule):
                     length_scale=scales[1],
                     noise_scale_w=scales[2],
                     sid=sid,
-                    max_len=2000 
+                    max_len=2000,
                 )
 
             audio = audio.squeeze()
@@ -586,7 +661,7 @@ class VitsModel(L.LightningModule):
             max_val = np.abs(audio_np).max()
             if max_val > 0.9:
                 audio_np = audio_np / max_val * 0.9
-            
+
             audio_int16 = (audio_np * 32767).astype(np.int16)
 
             filename = f"sample_{utt_idx}.wav"
@@ -595,7 +670,7 @@ class VitsModel(L.LightningModule):
             write_wav(filepath, self.hparams.sample_rate, audio_int16)
 
             if has_tb_audio:
-                audio_tb = torch.from_numpy(audio_np).unsqueeze(0)  # [1, T]
+                audio_tb = torch.from_numpy(audio_np).unsqueeze(0)
                 tag = test_utt.text or str(utt_idx)
 
                 logger.experiment.add_audio(
@@ -608,8 +683,18 @@ class VitsModel(L.LightningModule):
         return super().on_validation_end()
 
     def configure_optimizers(self):
-        optim_g = torch.optim.AdamW(self.model_g.parameters(), lr=self.hparams.learning_rate, betas=self.hparams.betas, eps=self.hparams.eps)
-        optim_d = torch.optim.AdamW(self.model_d.parameters(), lr=self.hparams.learning_rate_d, betas=self.hparams.betas_d, eps=self.hparams.eps)
+        optim_g = torch.optim.AdamW(
+            self.model_g.parameters(),
+            lr=self.hparams.learning_rate,
+            betas=self.hparams.betas,
+            eps=self.hparams.eps,
+        )
+        optim_d = torch.optim.AdamW(
+            self.model_d.parameters(),
+            lr=self.hparams.learning_rate_d,
+            betas=self.hparams.betas_d,
+            eps=self.hparams.eps,
+        )
 
         optimizers = [optim_g, optim_d]
         schedulers = [
@@ -618,8 +703,17 @@ class VitsModel(L.LightningModule):
         ]
 
         if self.model_dur is not None:
-            optim_dur = torch.optim.AdamW(self.model_dur.parameters(), lr=self.hparams.learning_rate_d, betas=self.hparams.betas_d, eps=self.hparams.eps)
+            optim_dur = torch.optim.AdamW(
+                self.model_dur.parameters(),
+                lr=self.hparams.learning_rate_d,
+                betas=self.hparams.betas_d,
+                eps=self.hparams.eps,
+            )
             optimizers.append(optim_dur)
-            schedulers.append(torch.optim.lr_scheduler.ExponentialLR(optim_dur, gamma=self.hparams.lr_decay_d))
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    optim_dur, gamma=self.hparams.lr_decay_d
+                )
+            )
 
         return optimizers, schedulers

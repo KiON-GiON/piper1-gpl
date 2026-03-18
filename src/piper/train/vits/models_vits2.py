@@ -607,10 +607,7 @@ class SynthesizerTrnVits2(nn.Module):
         else:
             g = None
 
-        if hasattr(self.enc_p, "forward") and ("g" in self.enc_p.forward.__code__.co_varnames):
-            hidden_x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
-        else:
-            hidden_x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+        hidden_x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
@@ -665,10 +662,7 @@ class SynthesizerTrnVits2(nn.Module):
         else:
             g = None
 
-        if hasattr(self.enc_p, "forward") and ("g" in self.enc_p.forward.__code__.co_varnames):
-            x_enc, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
-        else:
-            x_enc, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+        x_enc, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
 
         if self.use_sdp:
             logw = self.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)

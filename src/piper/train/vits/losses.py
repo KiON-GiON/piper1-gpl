@@ -58,28 +58,35 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     return l_kl
 
 def _mask_like_disc_output(d: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
-    """
-    d: salida del dur-disc. Suele ser [b, t, 1] (si viene de un Linear sobre time)
-       o [b, 1, t] (si fuese conv-style).
-    x_mask: [b, 1, t]
-    devuelve mask broadcastable a d, dtype float, mismo device.
-    """
-    x_mask = x_mask.float()
-
     if d.dim() != 3:
-        # fallback: sin máscara
-        return torch.ones_like(d, dtype=torch.float32)
+        raise ValueError(
+            f"Duration discriminator output must be 3D, got shape={tuple(d.shape)}"
+        )
+
+    if x_mask.dim() != 3 or x_mask.shape[1] != 1:
+        raise ValueError(
+            f"x_mask must have shape [b, 1, t], got shape={tuple(x_mask.shape)}"
+        )
+
+    if d.shape[0] != x_mask.shape[0]:
+        raise ValueError(
+            f"Batch mismatch between discriminator output {tuple(d.shape)} and x_mask {tuple(x_mask.shape)}"
+        )
+
+    x_mask = x_mask.float()
 
     # d: [b, t, 1]
     if d.shape[1] == x_mask.shape[2] and d.shape[2] == 1:
-        return x_mask.transpose(1, 2)  # [b, t, 1]
+        return x_mask.transpose(1, 2)
 
     # d: [b, 1, t]
-    if d.shape[2] == x_mask.shape[2] and d.shape[1] == 1:
-        return x_mask  # [b, 1, t]
+    if d.shape[1] == 1 and d.shape[2] == x_mask.shape[2]:
+        return x_mask
 
-    # si no coincide, no aplicamos máscara (mejor que romper)
-    return torch.ones_like(d, dtype=torch.float32)
+    raise ValueError(
+        f"Unsupported duration discriminator output shape {tuple(d.shape)} "
+        f"for x_mask shape {tuple(x_mask.shape)}"
+    )
 
 
 def masked_discriminator_loss(disc_real_outputs, disc_generated_outputs, x_mask: torch.Tensor):
@@ -115,7 +122,7 @@ def masked_generator_loss(disc_outputs, x_mask: torch.Tensor):
         denom = torch.clamp_min(m.sum(), 1.0)
 
         l = (((1.0 - dg) ** 2) * m).sum() / denom
-        gen_losses.append(l.item())
+        gen_losses.append(l)
         loss = loss + l
 
     return loss, gen_losses

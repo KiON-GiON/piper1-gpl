@@ -316,7 +316,7 @@ class VitsDataModule(L.LightningDataModule):
                 cache_id = get_cache_id(row_number, text, speaker_id=speaker_id)
 
                 phoneme_ids_path = self.cache_dir / f"{cache_id}.phonemes.pt"
-                if not phoneme_ids_path:
+                if not phoneme_ids_path.exists():
                     _LOGGER.warning(
                         "Missing phoneme ids for %s: %s",
                         audio_path,
@@ -325,7 +325,7 @@ class VitsDataModule(L.LightningDataModule):
                     continue
 
                 audio_norm_path = self.cache_dir / f"{cache_id}.audio.pt"
-                if not audio_norm_path:
+                if not audio_norm_path.exists():
                     _LOGGER.warning(
                         "Missing normalized audio for %s: %s",
                         audio_path,
@@ -334,7 +334,7 @@ class VitsDataModule(L.LightningDataModule):
                     continue
 
                 audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
-                if not audio_spec_path:
+                if not audio_spec_path.exists():
                     _LOGGER.warning(
                         "Missing mel spec for %s: %s",
                         audio_path,
@@ -405,7 +405,6 @@ class VitsDataModule(L.LightningDataModule):
         """Trims silence from original array."""
         vad.reset()
 
-        offset_sec: float = 0.0
         first_chunk: Optional[int] = None
         last_chunk: Optional[int] = None
         first_sample: Optional[int] = None
@@ -420,7 +419,6 @@ class VitsDataModule(L.LightningDataModule):
             chunk_offset = chunk_idx * samples_per_chunk
             chunk = audio_16khz_array[chunk_offset : chunk_offset + samples_per_chunk]
             if len(chunk) < samples_per_chunk:
-                # Can't process
                 continue
 
             prob = vad.process_array(chunk)
@@ -428,21 +426,17 @@ class VitsDataModule(L.LightningDataModule):
 
             if is_speech:
                 if first_chunk is None:
-                    # First speech
                     first_chunk = chunk_idx
-                else:
-                    # Last speech so far
-                    last_chunk = chunk_idx
+                last_chunk = chunk_idx
 
         if (first_chunk is not None) and (last_chunk is not None):
-            # Expand with seconds before/after silence
             num_original_samples = len(audio_original_array)
-            audio_seconds = len(audio_16khz_array) / 16000
+            audio_seconds = len(audio_16khz_array) / VAD_SAMPLE_RATE
 
             first_sec = first_chunk * seconds_per_chunk
-            first_sec = max(0, first_sec - self.keep_seconds_before_silence)
+            first_sec = max(0.0, first_sec - self.keep_seconds_before_silence)
             first_sample = int(
-                math.floor(num_original_samples * (offset_sec / audio_seconds))
+                math.floor(num_original_samples * (first_sec / audio_seconds))
             )
 
             last_sec = (last_chunk + 1) * seconds_per_chunk
@@ -571,7 +565,7 @@ class UtteranceCollate:
 
             if utt.speaker_id is not None:
                 assert speaker_ids is not None
-                speaker_ids[utt_idx] = utt.speaker_id
+                speaker_ids[utt_idx] = int(utt.speaker_id.item())
 
         return Batch(
             phoneme_ids=phonemes_padded,
