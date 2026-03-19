@@ -705,14 +705,14 @@ class VitsModel(L.LightningModule):
         if self.model_dur is not None:
             optim_dur = torch.optim.AdamW(
                 self.model_dur.parameters(),
-                lr=self.hparams.learning_rate_d,
-                betas=self.hparams.betas_d,
+                lr=self.hparams.learning_rate,
+                betas=self.hparams.betas,
                 eps=self.hparams.eps,
             )
             optimizers.append(optim_dur)
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
-                    optim_dur, gamma=self.hparams.lr_decay_d
+                    optim_dur, gamma=self.hparams.lr_decay
                 )
             )
 
