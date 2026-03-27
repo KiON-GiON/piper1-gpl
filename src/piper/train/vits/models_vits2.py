@@ -16,14 +16,7 @@ from .attentions_vits2 import Encoder as EncoderSpkCond
 from .attentions_vits2 import FFT as FFTBlock
 
 
-class StochasticDurationPredictorVits2(nn.Module):
-    """
-    Paper-inspired stochastic duration predictor for VITS2.
-
-    Not flow-based like VITS1 SDP.
-    It predicts log-duration from text hidden states + Gaussian noise z_d.
-    """
-
+class DurationPredictorVits2(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -704,7 +697,7 @@ class SynthesizerTrnVits2(nn.Module):
             )
         else:
             if self.vits2_use_stochastic_dp:
-                self.dp = StochasticDurationPredictorVits2(
+                self.dp = DurationPredictorVits2(
                     hidden_channels,
                     256,
                     3,
