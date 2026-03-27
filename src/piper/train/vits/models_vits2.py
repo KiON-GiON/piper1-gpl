@@ -620,7 +620,7 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_use_noise_scaled_mas: bool = False,
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
-        vits2_use_stochastic_dp: bool = False,
+        vits2_use_dp: bool = False,
         vits2_dp_noise_channels: int = 1,
         vits2_dp_train_noise_scale: float = 1.0,
         **kwargs,
@@ -648,7 +648,7 @@ class SynthesizerTrnVits2(nn.Module):
         self.current_mas_noise_scale = self.mas_noise_scale_initial
         self.use_noise_scaled_mas = self.vits2_use_noise_scaled_mas
 
-        self.vits2_use_stochastic_dp = bool(vits2_use_stochastic_dp)
+        self.vits2_use_dp = bool(vits2_use_dp)
         self.vits2_dp_train_noise_scale = float(vits2_dp_train_noise_scale)
 
         if self.n_speakers > 1:
@@ -696,7 +696,7 @@ class SynthesizerTrnVits2(nn.Module):
                 hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
             )
         else:
-            if self.vits2_use_stochastic_dp:
+            if self.vits2_use_dp:
                 self.dp = DurationPredictorVits2(
                     hidden_channels,
                     256,
@@ -747,7 +747,7 @@ class SynthesizerTrnVits2(nn.Module):
             l_length = l_length / torch.sum(x_mask)
             logw = self.dp(hidden_x, x_mask, g=g, reverse=True, noise_scale=1.0)
         else:
-            if self.vits2_use_stochastic_dp:
+            if self.vits2_use_dp:
                 logw = self.dp(
                     hidden_x,
                     x_mask,
@@ -788,7 +788,7 @@ class SynthesizerTrnVits2(nn.Module):
         if self.use_sdp:
             logw = self.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
         else:
-            if self.vits2_use_stochastic_dp:
+            if self.vits2_use_dp:
                 logw = self.dp(
                     x_enc,
                     x_mask,
