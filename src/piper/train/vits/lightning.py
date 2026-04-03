@@ -96,12 +96,10 @@ class VitsModel(L.LightningModule):
         vits2_use_noise_scaled_mas: bool = False,
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
+        vits2_infer_sdp_ratio: float = 0.2,
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
-        vits2_use_dp: bool = False,
-        vits2_dp_noise_channels: int = 1,
-        vits2_dp_train_noise_scale: float = 1.0,
         log_vits2_features: bool = True,
         # training
         learning_rate: float = 2e-4,
@@ -231,9 +229,7 @@ class VitsModel(L.LightningModule):
                     vits2_use_noise_scaled_mas=self.hparams.vits2_use_noise_scaled_mas,
                     vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
                     vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
-                    vits2_use_dp=self.hparams.vits2_use_dp,
-                    vits2_dp_noise_channels=self.hparams.vits2_dp_noise_channels,
-                    vits2_dp_train_noise_scale=self.hparams.vits2_dp_train_noise_scale,
+                    vits2_infer_sdp_ratio=self.hparams.vits2_infer_sdp_ratio,
                 )
             )
 
@@ -285,6 +281,25 @@ class VitsModel(L.LightningModule):
         ckpt_has_speaker_emb = any("emb_g" in k for k in state.keys())
         model_is_multispeaker = self.hparams.num_speakers > 1
 
+        model_has_sdp = any(k.startswith("sdp.") for k in model_state.keys())
+        ckpt_has_sdp = any(k.startswith("sdp.") for k in state.keys())
+
+        ckpt_old_sdp_under_dp = (
+            model_has_sdp
+            and (not ckpt_has_sdp)
+            and any(
+                k.startswith("dp.log_flow")
+                or k.startswith("dp.flows.")
+                or k.startswith("dp.post_pre.")
+                or k.startswith("dp.post_proj.")
+                or k.startswith("dp.post_convs.")
+                or k.startswith("dp.post_flows.")
+                for k in state.keys()
+            )
+        )
+
+        remapped_dp_to_sdp = 0
+
         transferred = []
         skipped_missing = []
         skipped_speaker_cond = []
@@ -294,6 +309,7 @@ class VitsModel(L.LightningModule):
             "emb_g",
             "dec.cond",
             "dp.cond",
+            "sdp.cond",
             "cond_layer",
         )
 
@@ -303,6 +319,12 @@ class VitsModel(L.LightningModule):
                 if name.startswith(prefix):
                     name = name[len(prefix):]
                     break
+
+            if ckpt_old_sdp_under_dp and name.startswith("dp."):
+                mapped_name = "sdp." + name[3:]
+                if mapped_name in model_state:
+                    name = mapped_name
+                    remapped_dp_to_sdp += 1
 
             if any(pattern in name for pattern in speaker_cond_patterns):
                 if not ckpt_has_speaker_emb and model_is_multispeaker:
@@ -349,6 +371,12 @@ class VitsModel(L.LightningModule):
                 _LOGGER.info("  %s: origin=%s, destination=%s", name, src_shape, dst_shape)
             if len(skipped_shape) > 10:
                 _LOGGER.info("  ... and %d more", len(skipped_shape) - 10)
+
+        if remapped_dp_to_sdp > 0:
+            _LOGGER.info(
+                "init_from_checkpoint: remapped %d old SDP parameters from dp.* to sdp.*",
+                remapped_dp_to_sdp,
+            )
 
     def forward(self, text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
