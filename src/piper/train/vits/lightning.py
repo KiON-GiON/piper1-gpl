@@ -30,6 +30,10 @@ from .models import MultiPeriodDiscriminator, SynthesizerTrn
 from .models_vits2 import SynthesizerTrnVits2
 from .duration_discriminators import build_duration_discriminator
 
+from .decoder_factory import resolve_decoder_type, decoder_output_hop_length
+from .pqmf import PQMF
+from .stft_loss import MultiResolutionSTFTLoss
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -47,6 +51,7 @@ class _ForwardPack:
     logs_p: torch.Tensor
     logs_q: torch.Tensor
     extra: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    decoder_aux: Optional[Any] = None
 
 
 class VitsModel(L.LightningModule):
@@ -103,6 +108,19 @@ class VitsModel(L.LightningModule):
         vits2_dp_noise_channels: int = 1,
         vits2_dp_train_noise_scale: float = 1.0,
         log_vits2_features: bool = True,
+        # Decoder + subbands
+        decoder_type: Optional[str] = None,
+        istft_vits: bool = False,
+        mb_istft_vits: bool = False,
+        ms_istft_vits: bool = False,
+        gen_istft_n_fft: int = 16,
+        gen_istft_hop_size: int = 4,
+        subbands: int = 4,
+        use_subband_stft_loss: bool = False,
+        subband_stft_loss_weight: float = 1.0,
+        subband_stft_fft_sizes=(384, 683, 171),
+        subband_stft_hop_sizes=(30, 60, 10),
+        subband_stft_win_lengths=(150, 300, 60),
         # training
         learning_rate: float = 2e-4,
         learning_rate_d: float = 1e-4,
@@ -148,9 +166,45 @@ class VitsModel(L.LightningModule):
         if isinstance(self.hparams.betas_d, str):
             self.hparams.betas_d = ast.literal_eval(self.hparams.betas_d)
 
-        expected_hop_length = reduce(operator.mul, self.hparams.upsample_rates, 1)
-        if expected_hop_length != hop_length:
-            raise ValueError("Upsample rates do not match hop length")
+        if isinstance(self.hparams.subband_stft_fft_sizes, str):
+            self.hparams.subband_stft_fft_sizes = ast.literal_eval(self.hparams.subband_stft_fft_sizes)
+        if isinstance(self.hparams.subband_stft_hop_sizes, str):
+            self.hparams.subband_stft_hop_sizes = ast.literal_eval(self.hparams.subband_stft_hop_sizes)
+        if isinstance(self.hparams.subband_stft_win_lengths, str):
+            self.hparams.subband_stft_win_lengths = ast.literal_eval(self.hparams.subband_stft_win_lengths)
+
+        if isinstance(self.hparams.subbands, bool):
+            self.hparams.subbands = 1 if not self.hparams.subbands else 4
+
+        effective_decoder_type = resolve_decoder_type(
+            decoder_type=self.hparams.decoder_type,
+            istft_vits=self.hparams.istft_vits,
+            mb_istft_vits=self.hparams.mb_istft_vits,
+            ms_istft_vits=self.hparams.ms_istft_vits,
+        )
+
+        expected_hop_length = decoder_output_hop_length(
+            decoder_type=effective_decoder_type,
+            upsample_rates=self.hparams.upsample_rates,
+            gen_istft_hop_size=self.hparams.gen_istft_hop_size,
+            subbands=self.hparams.subbands,
+        )
+
+        self._effective_decoder_type = effective_decoder_type
+
+        self._uses_istft_decoder = self._effective_decoder_type in {
+            "istft",
+            "mb_istft",
+            "ms_istft",
+        }
+        self._uses_multiband_decoder = self._effective_decoder_type == "mb_istft"
+        self._uses_multistream_decoder = self._effective_decoder_type == "ms_istft"
+
+        self._use_subband_loss = (
+            self.hparams.use_vits2
+            and self._uses_multiband_decoder
+            and bool(self.hparams.use_subband_stft_loss)
+        )
 
         self.hparams.resblock = str(self.hparams.resblock)
 
@@ -183,6 +237,13 @@ class VitsModel(L.LightningModule):
                 "use_mel_posterior_encoder=%s (spec_channels=%s)",
                 self.hparams.use_mel_posterior_encoder,
                 spec_channels,
+            )
+            _LOGGER.info(
+                "decoder_type=%s, gen_istft_n_fft=%s, gen_istft_hop_size=%s, subbands=%s",
+                effective_decoder_type,
+                self.hparams.gen_istft_n_fft,
+                self.hparams.gen_istft_hop_size,
+                self.hparams.subbands,
             )
             if self.hparams.use_vits2:
                 _LOGGER.info(
@@ -234,10 +295,30 @@ class VitsModel(L.LightningModule):
                     vits2_use_dp=self.hparams.vits2_use_dp,
                     vits2_dp_noise_channels=self.hparams.vits2_dp_noise_channels,
                     vits2_dp_train_noise_scale=self.hparams.vits2_dp_train_noise_scale,
+                    decoder_type=self.hparams.decoder_type,
+                    istft_vits=self.hparams.istft_vits,
+                    mb_istft_vits=self.hparams.mb_istft_vits,
+                    ms_istft_vits=self.hparams.ms_istft_vits,
+                    gen_istft_n_fft=self.hparams.gen_istft_n_fft,
+                    gen_istft_hop_size=self.hparams.gen_istft_hop_size,
+                    subbands=self.hparams.subbands,
                 )
             )
 
         self.model_g = SynthClass(**model_g_kwargs)
+
+        self._effective_decoder_type = effective_decoder_type
+
+        self.mb_pqmf = None
+        self.subband_stft_loss = None
+
+        if self._use_subband_loss:
+            self.mb_pqmf = PQMF(subbands=int(self.hparams.subbands))
+            self.subband_stft_loss = MultiResolutionSTFTLoss(
+                fft_sizes=tuple(self.hparams.subband_stft_fft_sizes),
+                hop_sizes=tuple(self.hparams.subband_stft_hop_sizes),
+                win_lengths=tuple(self.hparams.subband_stft_win_lengths),
+            )
 
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
@@ -407,7 +488,8 @@ class VitsModel(L.LightningModule):
         out = self.model_g(x, x_lengths, y_in, spec_lengths, speaker_ids)
 
         extra = None
-        if isinstance(out, (tuple, list)) and (len(out) == 8):
+        decoder_aux = None
+        if isinstance(out, (tuple, list)) and (len(out) == 9):
             (
                 y_hat,
                 l_length,
@@ -417,6 +499,7 @@ class VitsModel(L.LightningModule):
                 z_mask,
                 (_z, z_p, m_p, logs_p, _m_q, logs_q),
                 extra,
+                decoder_aux,
             ) = out
         else:
             (
@@ -435,6 +518,8 @@ class VitsModel(L.LightningModule):
             y, ids_slice * self.hparams.hop_length, self.hparams.segment_size
         )
 
+        y_hat = y_hat[..., : y_slice.shape[-1]]
+
         y_hat_mel = mel_spectrogram_torch(
             y_hat.squeeze(1),
             self.hparams.filter_length,
@@ -445,8 +530,6 @@ class VitsModel(L.LightningModule):
             self.hparams.mel_fmin,
             self.hparams.mel_fmax,
         )
-
-        y_hat = y_hat[..., : y_slice.shape[-1]]
 
         if extra is not None:
             try:
@@ -468,6 +551,7 @@ class VitsModel(L.LightningModule):
             logs_p=logs_p,
             logs_q=logs_q,
             extra=extra,
+            decoder_aux=decoder_aux,
         )
 
     def _loss_d_audio(self, y: torch.Tensor, y_hat: torch.Tensor) -> torch.Tensor:
@@ -518,6 +602,34 @@ class VitsModel(L.LightningModule):
         with autocast(self.device.type, enabled=False):
             loss_dur_gen, _ = masked_generator_loss(y_dur_g2, x_mask)
         return loss_dur_gen
+
+    def _loss_g_subband(self, y: torch.Tensor, decoder_aux: Optional[Any]):
+        if not self._use_subband_loss:
+            return None
+
+        if (self.mb_pqmf is None) or (self.subband_stft_loss is None) or (decoder_aux is None):
+            return None
+
+        if isinstance(decoder_aux, dict):
+            y_hat_mb = decoder_aux.get("subband_audio", None)
+        else:
+            y_hat_mb = None
+
+        if y_hat_mb is None:
+            return None
+
+        y_mb = self.mb_pqmf.analysis(y)
+
+        y_mb = y_mb.contiguous().view(-1, y_mb.size(-1))
+        y_hat_mb = y_hat_mb.contiguous().view(-1, y_hat_mb.size(-1))
+
+        min_len = min(y_mb.size(-1), y_hat_mb.size(-1))
+        y_mb = y_mb[:, :min_len]
+        y_hat_mb = y_hat_mb[:, :min_len]
+
+        with autocast(self.device.type, enabled=False):
+            sc_loss, mag_loss = self.subband_stft_loss(y_hat_mb.float(), y_mb.float())
+            return (sc_loss + mag_loss) * float(self.hparams.subband_stft_loss_weight)
 
     def training_step(self, batch: Batch, batch_idx: int):
         opts = self.optimizers()
@@ -575,6 +687,10 @@ class VitsModel(L.LightningModule):
         loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
         loss_fixed, loss_mel, loss_dur, loss_kl = self._loss_g_fixed_terms(pack)
         loss_g = loss_adv_fm + loss_fixed
+        loss_subband = self._loss_g_subband(pack.y, pack.decoder_aux)
+        if loss_subband is not None:
+            loss_g = loss_g + loss_subband
+            self.log("loss_subband", loss_subband, batch_size=batch_size)
 
         if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
             loss_g = loss_g + self._loss_g_dur(pack.extra, pack.x_mask)
@@ -601,6 +717,11 @@ class VitsModel(L.LightningModule):
             loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
             loss_fixed, _loss_mel, _loss_dur, _loss_kl = self._loss_g_fixed_terms(pack)
             val_loss = loss_adv_fm + loss_fixed
+
+            loss_subband = self._loss_g_subband(pack.y, pack.decoder_aux)
+            if loss_subband is not None:
+                val_loss = val_loss + loss_subband
+                self.log("val_loss_subband", loss_subband, batch_size=batch_size)
 
             if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
                 val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask)

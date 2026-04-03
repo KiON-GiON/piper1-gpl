@@ -14,6 +14,7 @@ from .models import (
 
 from .attentions_vits2 import Encoder as EncoderSpkCond
 from .attentions_vits2 import FFT as FFTBlock
+from .decoder_factory import build_decoder, resolve_decoder_type
 
 
 class DurationPredictorVits2(nn.Module):
@@ -623,6 +624,15 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_use_dp: bool = False,
         vits2_dp_noise_channels: int = 1,
         vits2_dp_train_noise_scale: float = 1.0,
+        # Decoder type + subbands
+        decoder_type: str | None = None,
+        istft_vits: bool = False,
+        mb_istft_vits: bool = False,
+        ms_istft_vits: bool = False,
+        gen_istft_n_fft: int = 16,
+        gen_istft_hop_size: int = 4,
+        subbands: int = 4,
+        is_onnx: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -667,15 +677,30 @@ class SynthesizerTrnVits2(nn.Module):
                 n_heads, n_layers, kernel_size, p_dropout
             )
 
-        self.dec = Generator(
-            inter_channels,
-            resblock,
-            resblock_kernel_sizes,
-            resblock_dilation_sizes,
-            upsample_rates,
-            upsample_initial_channel,
-            upsample_kernel_sizes,
+        self.decoder_type = resolve_decoder_type(
+            decoder_type=decoder_type,
+            istft_vits=istft_vits,
+            mb_istft_vits=mb_istft_vits,
+            ms_istft_vits=ms_istft_vits,
+        )
+        self.gen_istft_n_fft = int(gen_istft_n_fft)
+        self.gen_istft_hop_size = int(gen_istft_hop_size)
+        self.subbands = int(subbands)
+
+        self.dec = build_decoder(
+            decoder_type=self.decoder_type,
+            initial_channel=inter_channels,
+            resblock=resblock,
+            resblock_kernel_sizes=resblock_kernel_sizes,
+            resblock_dilation_sizes=resblock_dilation_sizes,
+            upsample_rates=upsample_rates,
+            upsample_initial_channel=upsample_initial_channel,
+            upsample_kernel_sizes=upsample_kernel_sizes,
             gin_channels=gin_channels,
+            gen_istft_n_fft=self.gen_istft_n_fft,
+            gen_istft_hop_size=self.gen_istft_hop_size,
+            subbands=self.subbands,
+            is_onnx=is_onnx,
         )
         self.enc_q = PosteriorEncoder(
             spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels
@@ -709,6 +734,20 @@ class SynthesizerTrnVits2(nn.Module):
                 self.dp = DurationPredictor(
                     hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
                 )
+
+    def _decode(self, z, g=None):
+        dec_out = self.dec(z, g=g)
+        if isinstance(dec_out, (tuple, list)):
+            audio = dec_out[0]
+            decoder_aux = dec_out[1] if len(dec_out) > 1 else None
+        else:
+            audio = dec_out
+            decoder_aux = None
+
+        if audio.dim() == 2:
+            audio = audio.unsqueeze(1)
+
+        return audio, decoder_aux
 
     def forward(self, x, x_lengths, y, y_lengths, sid=None):
         from . import monotonic_align
@@ -763,7 +802,7 @@ class SynthesizerTrnVits2(nn.Module):
         logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
         z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
-        o = self.dec(z_slice, g=g)
+                o, decoder_aux = self._decode(z_slice, g=g)
 
         return (
             o,
@@ -774,6 +813,7 @@ class SynthesizerTrnVits2(nn.Module):
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
             (hidden_x, logw, logw_),
+            decoder_aux,
         )
 
     def infer(self, x, x_lengths, sid=None, noise_scale=0.667, length_scale=1, noise_scale_w=0.8, max_len=None):
@@ -811,5 +851,5 @@ class SynthesizerTrnVits2(nn.Module):
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=g, reverse=True)
-        o = self.dec((z * y_mask)[:, :, :max_len], g=g)
+        o, _ = self._decode((z * y_mask)[:, :, :max_len], g=g)
         return o, attn, y_mask, (z, z_p, m_p, logs_p)

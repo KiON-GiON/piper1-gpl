@@ -126,3 +126,14 @@ def masked_generator_loss(disc_outputs, x_mask: torch.Tensor):
         loss = loss + l
 
     return loss, gen_losses
+
+def subband_stft_loss_from_module(stft_loss_module, y_mb, y_hat_mb):
+    y_mb = y_mb.contiguous().view(-1, y_mb.size(-1))
+    y_hat_mb = y_hat_mb.contiguous().view(-1, y_hat_mb.size(-1))
+
+    min_len = min(y_mb.size(-1), y_hat_mb.size(-1))
+    y_mb = y_mb[:, :min_len]
+    y_hat_mb = y_hat_mb[:, :min_len]
+
+    sc_loss, mag_loss = stft_loss_module(y_hat_mb, y_mb)
+    return sc_loss + mag_loss
