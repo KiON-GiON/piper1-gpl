@@ -62,6 +62,13 @@ def main() -> None:
     model_g.eval()
 
     with torch.no_grad():
+        if hasattr(model_g, "dec") and hasattr(model_g.dec, "switch_to_onnx"):
+            try:
+                model_g.dec.switch_to_onnx()
+                _LOGGER.info("Decoder STFT: switched to OnnxSTFT for export")
+            except Exception as e:
+                _LOGGER.warning("Decoder STFT: could not switch to OnnxSTFT (%s)", e)
+
         if hasattr(model_g.dec, "remove_weight_norm"):
             model_g.dec.remove_weight_norm()
         recursive_remove_weight_norm(model_g)
