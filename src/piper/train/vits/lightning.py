@@ -310,8 +310,6 @@ class VitsModel(L.LightningModule):
 
         self.model_g = SynthClass(**model_g_kwargs)
 
-        self._effective_decoder_type = effective_decoder_type
-
         self.mb_pqmf = None
         self.subband_stft_loss = None
 
