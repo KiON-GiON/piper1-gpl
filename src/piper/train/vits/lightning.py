@@ -322,7 +322,7 @@ class VitsModel(L.LightningModule):
 
             if ckpt_old_sdp_under_dp and name.startswith("dp."):
                 mapped_name = "sdp." + name[3:]
-                if mapped_name in model_state:
+                if (mapped_name in model_state) and (model_state[mapped_name].shape == param.shape):
                     name = mapped_name
                     remapped_dp_to_sdp += 1
 
