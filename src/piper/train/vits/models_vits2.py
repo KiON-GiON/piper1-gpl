@@ -283,6 +283,150 @@ class FFTransformerCouplingLayer(nn.Module):
         return torch.cat([x0, x1], 1)
 
 
+class MeloTransformerCouplingLayer(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        n_layers: int,
+        n_heads: int,
+        p_dropout: float = 0.0,
+        filter_channels: int = 768,
+        mean_only: bool = False,
+        wn_sharing_parameter=None,
+        gin_channels: int = 0,
+        cond_layer_idx: int = 2,
+    ):
+        super().__init__()
+        assert channels % 2 == 0
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.half_channels = channels // 2
+        self.mean_only = mean_only
+
+        self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
+        self.enc = (
+            EncoderSpkCond(
+                hidden_channels,
+                filter_channels,
+                n_heads,
+                n_layers,
+                kernel_size,
+                p_dropout,
+                gin_channels=gin_channels,
+                cond_layer_idx=cond_layer_idx,
+            )
+            if wn_sharing_parameter is None
+            else wn_sharing_parameter
+        )
+        self.post = nn.Conv1d(
+            hidden_channels,
+            self.half_channels * (2 - int(mean_only)),
+            1,
+        )
+        self.post.weight.data.zero_()
+        self.post.bias.data.zero_()
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
+
+        h = self.pre(x0) * x_mask
+        h = self.enc(h, x_mask, g=g)
+        stats = self.post(h) * x_mask
+
+        if not self.mean_only:
+            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
+        else:
+            m = stats
+            logs = torch.zeros_like(m)
+
+        if not reverse:
+            x1 = m + x1 * torch.exp(logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            logdet = torch.sum(logs, [1, 2])
+            return x, logdet
+
+        x1 = (x1 - m) * torch.exp(-logs) * x_mask
+        return torch.cat([x0, x1], 1)
+
+
+class MeloTransformerCouplingBlock(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        filter_channels: int,
+        n_heads: int,
+        n_layers: int,
+        kernel_size: int,
+        p_dropout: float,
+        n_flows: int = 4,
+        gin_channels: int = 0,
+        share_parameter: bool = False,
+        cond_layer_idx: int = 2,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.flows = nn.ModuleList()
+
+        self.wn = (
+            EncoderSpkCond(
+                hidden_channels,
+                filter_channels,
+                n_heads,
+                n_layers,
+                kernel_size,
+                p_dropout,
+                gin_channels=gin_channels,
+                cond_layer_idx=cond_layer_idx,
+            )
+            if share_parameter
+            else None
+        )
+
+        for _ in range(n_flows):
+            self.flows.append(
+                MeloTransformerCouplingLayer(
+                    channels=channels,
+                    hidden_channels=hidden_channels,
+                    kernel_size=kernel_size,
+                    n_layers=n_layers,
+                    n_heads=n_heads,
+                    p_dropout=p_dropout,
+                    filter_channels=filter_channels,
+                    mean_only=True,
+                    wn_sharing_parameter=self.wn,
+                    gin_channels=gin_channels,
+                    cond_layer_idx=cond_layer_idx,
+                )
+            )
+            self.flows.append(modules.Flip())
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        if not reverse:
+            for flow in self.flows:
+                r = flow(x, x_mask, g=g, reverse=False)
+                x = r[0] if isinstance(r, tuple) else r
+            return x
+
+        for flow in reversed(self.flows):
+            r = flow(x, x_mask, g=g, reverse=True)
+            x = r[0] if isinstance(r, tuple) else r
+        return x
+
+
 class MonoTransformerFlowLayer(nn.Module):
     def __init__(self, channels: int, mean_only: bool = False, residual_connection: bool = False):
         super().__init__()
@@ -530,6 +674,9 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
         vits2_infer_sdp_ratio: float = 0.2,
+        vits2_n_flow_layer: int = 4,
+        vits2_n_layers_trans_flow: int = 3,
+        vits2_transformer_flow_share_parameter: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -556,6 +703,12 @@ class SynthesizerTrnVits2(nn.Module):
         self.use_noise_scaled_mas = self.vits2_use_noise_scaled_mas
 
         self.vits2_infer_sdp_ratio = float(vits2_infer_sdp_ratio)
+
+        self.vits2_n_flow_layer = int(vits2_n_flow_layer)
+        self.vits2_n_layers_trans_flow = int(vits2_n_layers_trans_flow)
+        self.vits2_transformer_flow_share_parameter = bool(
+            vits2_transformer_flow_share_parameter
+        )
 
         if self.n_speakers > 1:
             self.emb_g = nn.Embedding(self.n_speakers, gin_channels)
@@ -588,14 +741,41 @@ class SynthesizerTrnVits2(nn.Module):
         )
 
         if self.vits2_use_transformer_flows:
-            self.flow = ResidualCouplingTransformersBlock(
-                inter_channels, hidden_channels, 5, 1, 4,
-                gin_channels=gin_channels,
-                use_transformer_flows=True,
-                transformer_flow_type=self.vits2_transformer_flow_type,
-            )
+            if self.vits2_transformer_flow_type == "melo_transformer":
+                self.flow = MeloTransformerCouplingBlock(
+                    channels=inter_channels,
+                    hidden_channels=hidden_channels,
+                    filter_channels=filter_channels,
+                    n_heads=n_heads,
+                    n_layers=self.vits2_n_layers_trans_flow,
+                    kernel_size=5,
+                    p_dropout=p_dropout,
+                    n_flows=self.vits2_n_flow_layer,
+                    gin_channels=gin_channels,
+                    share_parameter=self.vits2_transformer_flow_share_parameter,
+                    cond_layer_idx=self.vits2_cond_layer_idx,
+                )
+            else:
+                self.flow = ResidualCouplingTransformersBlock(
+                    inter_channels,
+                    hidden_channels,
+                    5,
+                    1,
+                    4,
+                    n_flows=self.vits2_n_flow_layer,
+                    gin_channels=gin_channels,
+                    use_transformer_flows=True,
+                    transformer_flow_type=self.vits2_transformer_flow_type,
+                )
         else:
-            self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
+            self.flow = ResidualCouplingBlock(
+                inter_channels,
+                hidden_channels,
+                5,
+                1,
+                self.vits2_n_flow_layer,
+                gin_channels=gin_channels,
+            )
 
         if use_sdp:
             self.sdp = StochasticDurationPredictor(
@@ -667,7 +847,7 @@ class SynthesizerTrnVits2(nn.Module):
             x_mask,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
-            (hidden_x, logw, logw_),
+            (hidden_x, logw, logw_, g),
         )
 
     def infer(self, x, x_lengths, sid=None, noise_scale=0.667, length_scale=1, noise_scale_w=0.8, max_len=None):

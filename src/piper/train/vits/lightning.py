@@ -46,7 +46,14 @@ class _ForwardPack:
     m_p: torch.Tensor
     logs_p: torch.Tensor
     logs_q: torch.Tensor
-    extra: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    extra: Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+        ]
+    ] = None
 
 
 class VitsModel(L.LightningModule):
@@ -97,6 +104,9 @@ class VitsModel(L.LightningModule):
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
         vits2_infer_sdp_ratio: float = 0.2,
+        vits2_n_flow_layer: int = 4,
+        vits2_n_layers_trans_flow: int = 3,
+        vits2_transformer_flow_share_parameter: bool = False,
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
@@ -115,6 +125,8 @@ class VitsModel(L.LightningModule):
         c_kl: float = 1.0,
         grad_clip: Optional[float] = None,
         init_from_checkpoint: Optional[str] = None,
+        init_from_checkpoint_d: Optional[str] = None,
+        init_from_checkpoint_dur: Optional[str] = None,
         # unused
         dataset: object = None,
         **kwargs,
@@ -230,6 +242,9 @@ class VitsModel(L.LightningModule):
                     vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
                     vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
                     vits2_infer_sdp_ratio=self.hparams.vits2_infer_sdp_ratio,
+                    vits2_n_flow_layer=self.hparams.vits2_n_flow_layer,
+                    vits2_n_layers_trans_flow=self.hparams.vits2_n_layers_trans_flow,
+                    vits2_transformer_flow_share_parameter=self.hparams.vits2_transformer_flow_share_parameter,
                 )
             )
 
@@ -241,15 +256,32 @@ class VitsModel(L.LightningModule):
 
         self.model_dur = None
         if self.hparams.use_duration_discriminator:
+            dur_gin = self.hparams.gin_channels if self.hparams.num_speakers > 1 else 0
             self.model_dur = build_duration_discriminator(
                 self.hparams.duration_discriminator_type,
                 hidden_channels=self.hparams.hidden_channels,
-                gin_channels=0,
+                gin_channels=dur_gin,
             )
 
         if init_from_checkpoint:
             self._load_generator_weights(init_from_checkpoint)
             self.hparams.init_from_checkpoint = None
+
+        if init_from_checkpoint_d:
+            self._load_partial_module_weights(
+                self.model_d,
+                init_from_checkpoint_d,
+                prefixes=("model_d.", "module.", "net_d."),
+            )
+            self.hparams.init_from_checkpoint_d = None
+
+        if (self.model_dur is not None) and init_from_checkpoint_dur:
+            self._load_partial_module_weights(
+                self.model_dur,
+                init_from_checkpoint_dur,
+                prefixes=("model_dur.", "module.", "net_dur_disc.", "dur_disc.", "net_dur."),
+            )
+            self.hparams.init_from_checkpoint_dur = None
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         checkpoint["mas_batch_step"] = int(self._mas_batch_step)
@@ -397,6 +429,59 @@ class VitsModel(L.LightningModule):
             if len(skipped_shape) > 20:
                 _LOGGER.info("  ... and %d more", len(skipped_shape) - 20)
 
+    def _load_partial_module_weights(
+        self,
+        module: torch.nn.Module,
+        ckpt_path: str,
+        prefixes: tuple[str, ...],
+    ) -> None:
+        if (not ckpt_path) or (not os.path.isfile(ckpt_path)):
+            _LOGGER.warning("checkpoint not found for %s: %s", module.__class__.__name__, ckpt_path)
+            return
+
+        _LOGGER.info("Loading %s weights from %s", module.__class__.__name__, ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        if "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+        elif "model" in ckpt:
+            state = ckpt["model"]
+        else:
+            state = ckpt
+
+        def _strip_known_prefixes(name: str) -> str:
+            changed = True
+            while changed:
+                changed = False
+                for prefix in prefixes:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        changed = True
+            return name
+
+        module_state = module.state_dict()
+        transferred = 0
+        skipped = 0
+
+        for full_name, param in state.items():
+            name = _strip_known_prefixes(full_name)
+            if name not in module_state:
+                skipped += 1
+                continue
+            if module_state[name].shape != param.shape:
+                skipped += 1
+                continue
+            module_state[name] = param
+            transferred += 1
+
+        module.load_state_dict(module_state, strict=False)
+        _LOGGER.info(
+            "%s: transferred=%d skipped=%d",
+            module.__class__.__name__,
+            transferred,
+            skipped,
+        )
+
     def forward(self, text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
         length_scale = scales[1]
@@ -497,8 +582,12 @@ class VitsModel(L.LightningModule):
 
         if extra is not None:
             try:
-                hidden_x, logw, logw_ = extra
-                extra = (hidden_x, logw, logw_)
+                if len(extra) == 4:
+                    hidden_x, logw, logw_, g = extra
+                else:
+                    hidden_x, logw, logw_ = extra
+                    g = None
+                extra = (hidden_x, logw, logw_, g)
             except Exception:
                 extra = None
 
@@ -544,24 +633,35 @@ class VitsModel(L.LightningModule):
         return loss_fixed, loss_mel, loss_dur, loss_kl
 
     def _loss_d_dur(
-        self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor
+        self,
+        extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        x_mask: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_x, logw, logw_ = extra
+        hidden_x, logw, logw_, g = extra
         y_dur_r, y_dur_g = self.model_dur(
             hidden_x.detach(),
             x_mask.detach(),
             logw_.detach(),
             logw.detach(),
+            g.detach() if g is not None else None,
         )
         with autocast(self.device.type, enabled=False):
             loss_dur_disc, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask)
         return loss_dur_disc
 
     def _loss_g_dur(
-        self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor
+        self,
+        extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        x_mask: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_x, logw, logw_ = extra
-        _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw)
+        hidden_x, logw, logw_, g = extra
+        _y_dur_r2, y_dur_g2 = self.model_dur(
+            hidden_x,
+            x_mask,
+            logw_,
+            logw,
+            g=g,
+        )
         with autocast(self.device.type, enabled=False):
             loss_dur_gen, _ = masked_generator_loss(y_dur_g2, x_mask)
         return loss_dur_gen
