@@ -644,12 +644,13 @@ class VitsModel(L.LightningModule):
         extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         x_mask: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_x, logw, logw_ = extra
+        hidden_x, logw, logw_, g = extra
         y_dur_r, y_dur_g = self.model_dur(
             hidden_x.detach(),
             x_mask.detach(),
             logw_.detach(),
             logw.detach(),
+            g.detach() if g not None else None,
         )
         with autocast(self.device.type, enabled=False):
             loss_dur_disc, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask)
@@ -660,8 +661,8 @@ class VitsModel(L.LightningModule):
         extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         x_mask: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_x, logw, logw_ = extra
-        _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw)
+        hidden_x, logw, logw_, g = extra
+        _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw, g)
         with autocast(self.device.type, enabled=False):
             loss_dur_gen, _ = masked_generator_loss(y_dur_g2, x_mask)
         return loss_dur_gen
