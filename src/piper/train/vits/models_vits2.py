@@ -530,6 +530,7 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_use_noise_scaled_mas: bool = False,
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
+        vits2_infer_sdp_ratio: float = 0.2,
         # Decoder type + subbands
         decoder_type: str | None = None,
         istft_vits: bool = False,
@@ -563,6 +564,8 @@ class SynthesizerTrnVits2(nn.Module):
         self.noise_scale_delta = float(vits2_noise_scale_delta)
         self.current_mas_noise_scale = self.mas_noise_scale_initial
         self.use_noise_scaled_mas = self.vits2_use_noise_scaled_mas
+
+        self.vits2_infer_sdp_ratio = float(vits2_infer_sdp_ratio)
 
         if self.n_speakers > 1:
             self.emb_g = nn.Embedding(self.n_speakers, gin_channels)
@@ -620,13 +623,17 @@ class SynthesizerTrnVits2(nn.Module):
             self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
 
         if use_sdp:
-            self.dp = StochasticDurationPredictor(
+            self.sdp = StochasticDurationPredictor(
                 hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
             )
-        else:
             self.dp = DurationPredictor(
                 hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
-        )
+            )
+        else:
+            self.sdp = None
+            self.dp = DurationPredictor(
+                hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
+            )
 
     def _decode(self, z, g=None):
         dec_out = self.dec(z, g=g)
@@ -671,16 +678,18 @@ class SynthesizerTrnVits2(nn.Module):
             attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 
         w = attn.sum(2)  # [b, 1, t_x]
-
         logw_ = torch.log(w + 1e-6) * x_mask
 
         if self.use_sdp:
-            l_length = self.dp(hidden_x, x_mask, w, g=g)
-            l_length = l_length / torch.sum(x_mask)
-            logw = self.dp(hidden_x, x_mask, g=g, reverse=True, noise_scale=1.0)
+            l_length_sdp = self.sdp(hidden_x, x_mask, w, g=g)
+            l_length_sdp = l_length_sdp / torch.sum(x_mask)
+
+            logw = self.dp(hidden_x, x_mask, g=g)
+            l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
+
+            l_length = l_length_sdp + l_length_dp
         else:
             logw = self.dp(hidden_x, x_mask, g=g)
-
             l_length = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
 
         m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
@@ -697,7 +706,7 @@ class SynthesizerTrnVits2(nn.Module):
             x_mask,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
-            (hidden_x, logw, logw_),
+            (hidden_x, logw, logw_, g),
             decoder_aux,
         )
 
@@ -711,7 +720,19 @@ class SynthesizerTrnVits2(nn.Module):
         x_enc, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
 
         if self.use_sdp:
-            logw = self.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+            logw_sdp = self.sdp(
+                x_enc,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=noise_scale_w,
+            )
+            logw_dp = self.dp(x_enc, x_mask, g=g)
+
+            sdp_ratio = float(self.vits2_infer_sdp_ratio)
+            sdp_ratio = max(0.0, min(1.0, sdp_ratio))
+
+            logw = logw_sdp * sdp_ratio + logw_dp * (1.0 - sdp_ratio)
         else:
             logw = self.dp(x_enc, x_mask, g=g)
 

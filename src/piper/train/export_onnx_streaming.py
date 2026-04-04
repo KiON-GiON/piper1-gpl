@@ -19,13 +19,14 @@ def recursive_remove_weight_norm(module: nn.Module) -> None:
         remove_weight_norm(module)
     except ValueError:
         pass
+    except Exception:
+        pass
 
     for child in module.children():
         recursive_remove_weight_norm(child)
 
 
 class VitsEncoder(nn.Module):
-
     def __init__(self, gen):
         super().__init__()
         self.gen = gen
@@ -48,14 +49,34 @@ class VitsEncoder(nn.Module):
 
         if gen.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
-            g = gen.emb_g(sid).unsqueeze(-1)  # [B, gin, 1]
+            g = gen.emb_g(sid).unsqueeze(-1)
         else:
             g = None
 
-        x_enc, m_p, logs_p, x_mask = gen.enc_p(x, x_lengths)
+        x_enc, m_p, logs_p, x_mask = gen.enc_p(x, x_lengths, g=g)
 
-        if gen.use_sdp:
-            logw = gen.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+        if hasattr(gen, "sdp") and (gen.sdp is not None):
+            logw_sdp = gen.sdp(
+                x_enc,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=noise_scale_w,
+            )
+            logw_dp = gen.dp(x_enc, x_mask, g=g)
+
+            sdp_ratio = float(getattr(gen, "vits2_infer_sdp_ratio", 0.2))
+            sdp_ratio = max(0.0, min(1.0, sdp_ratio))
+            logw = logw_sdp * sdp_ratio + logw_dp * (1.0 - sdp_ratio)
+
+        elif getattr(gen, "use_sdp", False):
+            logw = gen.dp(
+                x_enc,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=noise_scale_w,
+            )
         else:
             logw = gen.dp(x_enc, x_mask, g=g)
 
@@ -65,6 +86,7 @@ class VitsEncoder(nn.Module):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y_lengths.max()), 1
         ).type_as(x_mask)
+
         attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
         attn = commons.generate_path(w_ceil, attn_mask)
 
@@ -77,15 +99,38 @@ class VitsEncoder(nn.Module):
 
         if gen.n_speakers > 1:
             return z_p, y_mask, g
-        else:
-            return z_p, y_mask
+        return z_p, y_mask
 
 
 class VitsDecoder(nn.Module):
-
     def __init__(self, gen):
         super().__init__()
         self.gen = gen
+
+    def _decode_audio_only(
+        self,
+        z: torch.Tensor,
+        g: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if hasattr(self.gen, "_decode"):
+            audio, _decoder_aux = self.gen._decode(z, g=g)
+            return audio
+
+        dec_out = self.gen.dec(z, g=g)
+
+        if isinstance(dec_out, (tuple, list)):
+            audio = dec_out[0]
+        elif isinstance(dec_out, dict):
+            audio = dec_out.get("audio", None)
+            if audio is None:
+                raise ValueError("Decoder dict output does not contain 'audio'")
+        else:
+            audio = dec_out
+
+        if audio.dim() == 2:
+            audio = audio.unsqueeze(1)
+
+        return audio
 
     def forward(
         self,
@@ -94,8 +139,8 @@ class VitsDecoder(nn.Module):
         g: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         z = self.gen.flow(z, y_mask, g=g, reverse=True)
-        output = self.gen.dec(z * y_mask, g=g)
-        return output
+        audio = self._decode_audio_only(z * y_mask, g=g)
+        return audio
 
 
 def main() -> None:
@@ -131,14 +176,26 @@ def main() -> None:
     model_g.eval()
 
     with torch.no_grad():
-        if hasattr(model_g.dec, "remove_weight_norm"):
+        if hasattr(model_g, "dec") and hasattr(model_g.dec, "switch_to_onnx"):
+            _LOGGER.info("Switching decoder to ONNX-friendly STFT backend...")
+            model_g.dec.switch_to_onnx()
+
+        if hasattr(model_g, "dec") and hasattr(model_g.dec, "remove_weight_norm"):
             model_g.dec.remove_weight_norm()
+
         recursive_remove_weight_norm(model_g)
+
+    _LOGGER.info(
+        "Exporting streaming model (decoder_type=%s)...",
+        getattr(model_g, "decoder_type", "hifigan"),
+    )
 
     _LOGGER.info("Exporting encoder...")
     decoder_input = export_encoder(output_dir, model_g)
+
     _LOGGER.info("Exporting decoder...")
     export_decoder(output_dir, model_g, decoder_input)
+
     _LOGGER.info("Exported streaming model to %s", str(output_dir))
 
 
@@ -154,7 +211,6 @@ def export_encoder(output_dir: Path, model_g) -> tuple:
         low=0, high=num_symbols, size=(1, dummy_input_length), dtype=torch.long
     )
     sequence_lengths = torch.LongTensor([sequences.size(1)])
-
     scales = torch.FloatTensor([0.667, 1.0, 0.8])
 
     if num_speakers > 1:
@@ -211,8 +267,7 @@ def export_encoder(output_dir: Path, model_g) -> tuple:
 
     if isinstance(encoder_outputs, tuple):
         return encoder_outputs
-    else:
-        return (encoder_outputs,)
+    return (encoder_outputs,)
 
 
 def export_decoder(output_dir: Path, model_g, decoder_input: tuple) -> None:

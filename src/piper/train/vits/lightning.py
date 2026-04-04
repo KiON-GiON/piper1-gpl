@@ -50,7 +50,14 @@ class _ForwardPack:
     m_p: torch.Tensor
     logs_p: torch.Tensor
     logs_q: torch.Tensor
-    extra: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    extra: Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+        ]
+    ] = None
     decoder_aux: Optional[Any] = None
 
 
@@ -101,6 +108,7 @@ class VitsModel(L.LightningModule):
         vits2_use_noise_scaled_mas: bool = False,
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
+        vits2_infer_sdp_ratio: float = 0.2,
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
@@ -289,6 +297,7 @@ class VitsModel(L.LightningModule):
                     vits2_use_noise_scaled_mas=self.hparams.vits2_use_noise_scaled_mas,
                     vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
                     vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
+                    vits2_infer_sdp_ratio=self.hparams.vits2_infer_sdp_ratio,
                     decoder_type=self.hparams.decoder_type,
                     istft_vits=self.hparams.istft_vits,
                     mb_istft_vits=self.hparams.mb_istft_vits,
@@ -320,10 +329,13 @@ class VitsModel(L.LightningModule):
 
         self.model_dur = None
         if self.hparams.use_duration_discriminator:
+            dur_gin_channels = (
+                self.hparams.gin_channels if self.hparams.num_speakers > 1 else 0
+            )
             self.model_dur = build_duration_discriminator(
                 self.hparams.duration_discriminator_type,
                 hidden_channels=self.hparams.hidden_channels,
-                gin_channels=0,
+                gin_channels=dur_gin_channels,
             )
 
         if init_from_checkpoint:
@@ -357,27 +369,72 @@ class VitsModel(L.LightningModule):
 
         model_state = self.model_g.state_dict()
 
-        ckpt_has_speaker_emb = any("emb_g" in k for k in state.keys())
+        def _strip_known_prefixes(name: str) -> str:
+            prefixes = ("model_g.", "module.", "net_g.")
+            changed = True
+            while changed:
+                changed = False
+                for prefix in prefixes:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        changed = True
+            return name
+
+        normalized_state = {}
+        for full_name, param in state.items():
+            name = _strip_known_prefixes(full_name)
+            normalized_state[name] = param
+
+        model_has_sdp = any(k.startswith("sdp.") for k in model_state.keys())
+        ckpt_has_sdp = any(k.startswith("sdp.") for k in normalized_state.keys())
+
+        ckpt_old_sdp_under_dp = (
+            model_has_sdp
+            and (not ckpt_has_sdp)
+            and any(
+                k.startswith("dp.log_flow")
+                or k.startswith("dp.flows.")
+                or k.startswith("dp.post_pre.")
+                or k.startswith("dp.post_proj.")
+                or k.startswith("dp.post_convs.")
+                or k.startswith("dp.post_flows.")
+                or k.startswith("dp.pre.")
+                or k.startswith("dp.proj.")
+                or k.startswith("dp.convs.")
+                for k in normalized_state.keys()
+            )
+        )
+
+        if ckpt_old_sdp_under_dp:
+            _LOGGER.info(
+                "init_from_checkpoint: detected legacy checkpoint with SDP stored under dp.*"
+            )
+
+        ckpt_has_speaker_emb = any("emb_g" in k for k in normalized_state.keys())
         model_is_multispeaker = self.hparams.num_speakers > 1
 
         transferred = []
         skipped_missing = []
         skipped_speaker_cond = []
         skipped_shape = []
+        remapped_dp_to_sdp = 0
 
         speaker_cond_patterns = (
             "emb_g",
             "dec.cond",
             "dp.cond",
+            "sdp.cond",
             "cond_layer",
         )
 
-        for full_name, param in state.items():
-            name = full_name
-            for prefix in ["model_g.", "module.", "net_g."]:
-                if name.startswith(prefix):
-                    name = name[len(prefix):]
-                    break
+        for name, param in normalized_state.items():
+            original_name = name
+
+            if ckpt_old_sdp_under_dp and name.startswith("dp."):
+                mapped_name = "sdp." + name[3:]
+                if (mapped_name in model_state) and (model_state[mapped_name].shape == param.shape):
+                    name = mapped_name
+                    remapped_dp_to_sdp += 1
 
             if any(pattern in name for pattern in speaker_cond_patterns):
                 if not ckpt_has_speaker_emb and model_is_multispeaker:
@@ -389,7 +446,7 @@ class VitsModel(L.LightningModule):
                     continue
 
             if name not in model_state:
-                skipped_missing.append(name)
+                skipped_missing.append(original_name)
                 continue
 
             if model_state[name].shape != param.shape:
@@ -403,27 +460,33 @@ class VitsModel(L.LightningModule):
 
         _LOGGER.info("init_from_checkpoint: %d transferred parameters", len(transferred))
 
+        if remapped_dp_to_sdp > 0:
+            _LOGGER.info(
+                "init_from_checkpoint: remapped %d legacy SDP parameters from dp.* to sdp.*",
+                remapped_dp_to_sdp,
+            )
+
         if skipped_speaker_cond:
             _LOGGER.info(
                 "init_from_checkpoint: %d speaker conditioning parameters omitted "
                 "(single→multi speaker or different number of speakers): %s",
                 len(skipped_speaker_cond),
-                skipped_speaker_cond,
+                skipped_speaker_cond[:20],
             )
 
         if skipped_missing:
             _LOGGER.debug(
                 "init_from_checkpoint: %d parameters not found in destination model: %s",
                 len(skipped_missing),
-                skipped_missing[:10],
+                skipped_missing[:20],
             )
 
         if skipped_shape:
             _LOGGER.info("init_from_checkpoint: parameters omitted due to incompatible shape:")
-            for name, src_shape, dst_shape in skipped_shape[:10]:
+            for name, src_shape, dst_shape in skipped_shape[:20]:
                 _LOGGER.info("  %s: origin=%s, destination=%s", name, src_shape, dst_shape)
-            if len(skipped_shape) > 10:
-                _LOGGER.info("  ... and %d more", len(skipped_shape) - 10)
+            if len(skipped_shape) > 20:
+                _LOGGER.info("  ... and %d more", len(skipped_shape) - 20)
 
     def forward(self, text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
@@ -527,8 +590,12 @@ class VitsModel(L.LightningModule):
 
         if extra is not None:
             try:
-                hidden_x, logw, logw_ = extra
-                extra = (hidden_x, logw, logw_)
+                if len(extra) == 4:
+                    hidden_x, logw, logw_, g = extra
+                else:
+                    hidden_x, logw, logw_ = extra
+                    g = None
+                extra = (hidden_x, logw, logw_, g)
             except Exception:
                 extra = None
 
@@ -575,7 +642,9 @@ class VitsModel(L.LightningModule):
         return loss_fixed, loss_mel, loss_dur, loss_kl
 
     def _loss_d_dur(
-        self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor
+        self,
+        extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        x_mask: torch.Tensor,
     ) -> torch.Tensor:
         hidden_x, logw, logw_ = extra
         y_dur_r, y_dur_g = self.model_dur(
@@ -589,7 +658,9 @@ class VitsModel(L.LightningModule):
         return loss_dur_disc
 
     def _loss_g_dur(
-        self, extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], x_mask: torch.Tensor
+        self,
+        extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        x_mask: torch.Tensor,
     ) -> torch.Tensor:
         hidden_x, logw, logw_ = extra
         _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw)
