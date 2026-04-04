@@ -650,7 +650,7 @@ class VitsModel(L.LightningModule):
             x_mask.detach(),
             logw_.detach(),
             logw.detach(),
-            g.detach() if g not None else None,
+            g.detach() if g is not None else None,
         )
         with autocast(self.device.type, enabled=False):
             loss_dur_disc, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask)
