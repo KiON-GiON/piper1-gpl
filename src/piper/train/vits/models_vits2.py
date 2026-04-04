@@ -17,97 +17,6 @@ from .attentions_vits2 import FFT as FFTBlock
 from .decoder_factory import build_decoder, resolve_decoder_type
 
 
-class DurationPredictorVits2(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        filter_channels: int,
-        kernel_size: int,
-        p_dropout: float,
-        gin_channels: int = 0,
-        noise_channels: int = 1,
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.filter_channels = filter_channels
-        self.kernel_size = kernel_size
-        self.p_dropout = p_dropout
-        self.gin_channels = gin_channels
-        self.noise_channels = noise_channels
-
-        self.drop = nn.Dropout(p_dropout)
-
-        self.noise_proj = nn.Conv1d(noise_channels, in_channels, 1)
-
-        if gin_channels != 0:
-            self.cond = nn.Conv1d(gin_channels, in_channels, 1)
-
-        self.conv_1 = nn.Conv1d(
-            in_channels,
-            filter_channels,
-            kernel_size,
-            padding=kernel_size // 2,
-        )
-        self.norm_1 = modules.LayerNorm(filter_channels)
-
-        self.conv_2 = nn.Conv1d(
-            filter_channels,
-            filter_channels,
-            kernel_size,
-            padding=kernel_size // 2,
-        )
-        self.norm_2 = modules.LayerNorm(filter_channels)
-
-        self.proj = nn.Conv1d(filter_channels, 1, 1)
-
-    def forward(
-        self,
-        x,
-        x_mask,
-        g=None,
-        z=None,
-        noise_scale: float = 1.0,
-    ):
-        """
-        x: [B, C, T]
-        x_mask: [B, 1, T]
-        g: [B, gin_channels, 1] or None
-        z: optional external noise [B, noise_channels, T]
-        returns: log-duration prediction [B, 1, T]
-        """
-        x = torch.detach(x)
-
-        if g is not None:
-            g = torch.detach(g)
-            x = x + self.cond(g)
-
-        if z is None:
-            z = torch.randn(
-                x.size(0),
-                self.noise_channels,
-                x.size(2),
-                device=x.device,
-                dtype=x.dtype,
-            )
-
-        z = z * float(noise_scale)
-        x = x + self.noise_proj(z) * x_mask
-
-        x = self.conv_1(x * x_mask)
-        x = torch.relu(x)
-        x = self.norm_1(x)
-        x = self.drop(x)
-
-        x = self.conv_2(x * x_mask)
-        x = torch.relu(x)
-        x = self.norm_2(x)
-        x = self.drop(x)
-
-        x = self.proj(x * x_mask)
-        return x * x_mask
-
-
 class TextEncoderSpkConditioned(nn.Module):
     def __init__(
         self,
@@ -621,9 +530,6 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_use_noise_scaled_mas: bool = False,
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
-        vits2_use_dp: bool = False,
-        vits2_dp_noise_channels: int = 1,
-        vits2_dp_train_noise_scale: float = 1.0,
         # Decoder type + subbands
         decoder_type: str | None = None,
         istft_vits: bool = False,
@@ -657,9 +563,6 @@ class SynthesizerTrnVits2(nn.Module):
         self.noise_scale_delta = float(vits2_noise_scale_delta)
         self.current_mas_noise_scale = self.mas_noise_scale_initial
         self.use_noise_scaled_mas = self.vits2_use_noise_scaled_mas
-
-        self.vits2_use_dp = bool(vits2_use_dp)
-        self.vits2_dp_train_noise_scale = float(vits2_dp_train_noise_scale)
 
         if self.n_speakers > 1:
             self.emb_g = nn.Embedding(self.n_speakers, gin_channels)
@@ -721,19 +624,9 @@ class SynthesizerTrnVits2(nn.Module):
                 hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
             )
         else:
-            if self.vits2_use_dp:
-                self.dp = DurationPredictorVits2(
-                    hidden_channels,
-                    256,
-                    3,
-                    0.5,
-                    gin_channels=gin_channels,
-                    noise_channels=vits2_dp_noise_channels,
-                )
-            else:
-                self.dp = DurationPredictor(
-                    hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
-                )
+            self.dp = DurationPredictor(
+                hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
+        )
 
     def _decode(self, z, g=None):
         dec_out = self.dec(z, g=g)
@@ -786,15 +679,7 @@ class SynthesizerTrnVits2(nn.Module):
             l_length = l_length / torch.sum(x_mask)
             logw = self.dp(hidden_x, x_mask, g=g, reverse=True, noise_scale=1.0)
         else:
-            if self.vits2_use_dp:
-                logw = self.dp(
-                    hidden_x,
-                    x_mask,
-                    g=g,
-                    noise_scale=self.vits2_dp_train_noise_scale,
-                )
-            else:
-                logw = self.dp(hidden_x, x_mask, g=g)
+            logw = self.dp(hidden_x, x_mask, g=g)
 
             l_length = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
 
@@ -828,15 +713,7 @@ class SynthesizerTrnVits2(nn.Module):
         if self.use_sdp:
             logw = self.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
         else:
-            if self.vits2_use_dp:
-                logw = self.dp(
-                    x_enc,
-                    x_mask,
-                    g=g,
-                    noise_scale=noise_scale_w,
-                )
-            else:
-                logw = self.dp(x_enc, x_mask, g=g)
+            logw = self.dp(x_enc, x_mask, g=g)
 
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
