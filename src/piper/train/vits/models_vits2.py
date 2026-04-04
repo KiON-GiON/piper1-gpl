@@ -696,7 +696,7 @@ class SynthesizerTrnVits2(nn.Module):
         logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
         z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
-                o, decoder_aux = self._decode(z_slice, g=g)
+        o, decoder_aux = self._decode(z_slice, g=g)
 
         return (
             o,
