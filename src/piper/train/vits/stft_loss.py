@@ -4,12 +4,15 @@ from torch.nn import functional as F
 
 
 def stft(x, fft_size, hop_size, win_length, window):
+    x = x.float()
+    window = window.to(device=x.device, dtype=torch.float32)
+
     spec = torch.stft(
         x,
         n_fft=fft_size,
         hop_length=hop_size,
         win_length=win_length,
-        window=window.to(device=x.device, dtype=x.dtype),
+        window=window,
         center=True,
         return_complex=True,
     )

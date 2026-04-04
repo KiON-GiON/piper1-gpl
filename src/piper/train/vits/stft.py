@@ -23,25 +23,34 @@ class TorchSTFT(nn.Module):
         self.register_buffer("window", torch.from_numpy(win), persistent=False)
 
     def transform(self, input_data: torch.Tensor):
+        # STFT en float32 para evitar problemas con half/bfloat16
+        input_data = input_data.float()
+        window = self.window.to(device=input_data.device, dtype=torch.float32)
+
         spec = torch.stft(
             input_data,
             n_fft=self.filter_length,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window.to(device=input_data.device, dtype=input_data.dtype),
+            window=window,
             center=True,
             return_complex=True,
         )
         return torch.abs(spec), torch.angle(spec)
 
     def inverse(self, magnitude: torch.Tensor, phase: torch.Tensor):
+        # iSTFT en float32 para evitar errores de tipo
+        magnitude = magnitude.float()
+        phase = phase.float()
+        window = self.window.to(device=magnitude.device, dtype=torch.float32)
+
         spec = torch.polar(magnitude, phase)
         wav = torch.istft(
             spec,
             n_fft=self.filter_length,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window.to(device=magnitude.device, dtype=magnitude.dtype),
+            window=window,
             center=True,
             return_complex=False,
         )
@@ -89,12 +98,18 @@ class OnnxSTFT(nn.Module):
         self.register_buffer("inverse_basis", inverse_basis, persistent=False)
 
     def inverse(self, magnitude: torch.Tensor, phase: torch.Tensor):
+        # Siempre float32 para export y para evitar problemas con conv_transpose1d
+        magnitude = magnitude.float()
+        phase = phase.float()
+        inverse_basis = self.inverse_basis.to(device=magnitude.device, dtype=torch.float32)
+
         recombined = torch.cat(
             [magnitude * torch.cos(phase), magnitude * torch.sin(phase)], dim=1
         )
+
         x = F.conv_transpose1d(
             recombined,
-            self.inverse_basis.to(device=magnitude.device, dtype=magnitude.dtype),
+            inverse_basis,
             stride=self.hop_length,
             padding=0,
         )
