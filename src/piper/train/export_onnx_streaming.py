@@ -52,10 +52,31 @@ class VitsEncoder(nn.Module):
         else:
             g = None
 
-        x_enc, m_p, logs_p, x_mask = gen.enc_p(x, x_lengths)
+        x_enc, m_p, logs_p, x_mask = gen.enc_p(x, x_lengths, g=g)
 
-        if gen.use_sdp:
-            logw = gen.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+        if hasattr(gen, "sdp") and (gen.sdp is not None):
+            logw_sdp = gen.sdp(
+                x_enc,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=noise_scale_w,
+            )
+            logw_dp = gen.dp(x_enc, x_mask, g=g)
+
+            sdp_ratio = float(getattr(gen, "vits2_infer_sdp_ratio", 0.2))
+            sdp_ratio = max(0.0, min(1.0, sdp_ratio))
+
+            logw = logw_sdp * sdp_ratio + logw_dp * (1.0 - sdp_ratio)
+
+        elif getattr(gen, "use_sdp", False):
+            logw = gen.dp(
+                x_enc,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=noise_scale_w,
+            )
         else:
             logw = gen.dp(x_enc, x_mask, g=g)
 
