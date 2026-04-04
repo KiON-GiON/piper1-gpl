@@ -278,11 +278,24 @@ class VitsModel(L.LightningModule):
 
         model_state = self.model_g.state_dict()
 
-        ckpt_has_speaker_emb = any("emb_g" in k for k in state.keys())
-        model_is_multispeaker = self.hparams.num_speakers > 1
+        def _strip_known_prefixes(name: str) -> str:
+            prefixes = ("model_g.", "module.", "net_g.")
+            changed = True
+            while changed:
+                changed = False
+                for prefix in prefixes:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        changed = True
+            return name
+
+        normalized_state = {}
+        for full_name, param in state.items():
+            name = _strip_known_prefixes(full_name)
+            normalized_state[name] = param
 
         model_has_sdp = any(k.startswith("sdp.") for k in model_state.keys())
-        ckpt_has_sdp = any(k.startswith("sdp.") for k in state.keys())
+        ckpt_has_sdp = any(k.startswith("sdp.") for k in normalized_state.keys())
 
         ckpt_old_sdp_under_dp = (
             model_has_sdp
@@ -294,16 +307,26 @@ class VitsModel(L.LightningModule):
                 or k.startswith("dp.post_proj.")
                 or k.startswith("dp.post_convs.")
                 or k.startswith("dp.post_flows.")
-                for k in state.keys()
+                or k.startswith("dp.pre.")
+                or k.startswith("dp.proj.")
+                or k.startswith("dp.convs.")
+                for k in normalized_state.keys()
             )
         )
 
-        remapped_dp_to_sdp = 0
+        if ckpt_old_sdp_under_dp:
+            _LOGGER.info(
+                "init_from_checkpoint: detected legacy checkpoint with SDP stored under dp.*"
+            )
+
+        ckpt_has_speaker_emb = any("emb_g" in k for k in normalized_state.keys())
+        model_is_multispeaker = self.hparams.num_speakers > 1
 
         transferred = []
         skipped_missing = []
         skipped_speaker_cond = []
         skipped_shape = []
+        remapped_dp_to_sdp = 0
 
         speaker_cond_patterns = (
             "emb_g",
@@ -313,12 +336,8 @@ class VitsModel(L.LightningModule):
             "cond_layer",
         )
 
-        for full_name, param in state.items():
-            name = full_name
-            for prefix in ["model_g.", "module.", "net_g."]:
-                if name.startswith(prefix):
-                    name = name[len(prefix):]
-                    break
+        for name, param in normalized_state.items():
+            original_name = name
 
             if ckpt_old_sdp_under_dp and name.startswith("dp."):
                 mapped_name = "sdp." + name[3:]
@@ -336,7 +355,7 @@ class VitsModel(L.LightningModule):
                     continue
 
             if name not in model_state:
-                skipped_missing.append(name)
+                skipped_missing.append(original_name)
                 continue
 
             if model_state[name].shape != param.shape:
@@ -350,33 +369,33 @@ class VitsModel(L.LightningModule):
 
         _LOGGER.info("init_from_checkpoint: %d transferred parameters", len(transferred))
 
+        if remapped_dp_to_sdp > 0:
+            _LOGGER.info(
+                "init_from_checkpoint: remapped %d legacy SDP parameters from dp.* to sdp.*",
+                remapped_dp_to_sdp,
+            )
+
         if skipped_speaker_cond:
             _LOGGER.info(
                 "init_from_checkpoint: %d speaker conditioning parameters omitted "
                 "(single→multi speaker or different number of speakers): %s",
                 len(skipped_speaker_cond),
-                skipped_speaker_cond,
+                skipped_speaker_cond[:20],
             )
 
         if skipped_missing:
             _LOGGER.debug(
                 "init_from_checkpoint: %d parameters not found in destination model: %s",
                 len(skipped_missing),
-                skipped_missing[:10],
+                skipped_missing[:20],
             )
 
         if skipped_shape:
             _LOGGER.info("init_from_checkpoint: parameters omitted due to incompatible shape:")
-            for name, src_shape, dst_shape in skipped_shape[:10]:
+            for name, src_shape, dst_shape in skipped_shape[:20]:
                 _LOGGER.info("  %s: origin=%s, destination=%s", name, src_shape, dst_shape)
-            if len(skipped_shape) > 10:
-                _LOGGER.info("  ... and %d more", len(skipped_shape) - 10)
-
-        if remapped_dp_to_sdp > 0:
-            _LOGGER.info(
-                "init_from_checkpoint: remapped %d old SDP parameters from dp.* to sdp.*",
-                remapped_dp_to_sdp,
-            )
+            if len(skipped_shape) > 20:
+                _LOGGER.info("  ... and %d more", len(skipped_shape) - 20)
 
     def forward(self, text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
