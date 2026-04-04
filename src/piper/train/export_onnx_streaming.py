@@ -52,7 +52,7 @@ class VitsEncoder(nn.Module):
         else:
             g = None
 
-        x_enc, m_p, logs_p, x_mask = gen.enc_p(x, x_lengths)
+        x_enc, m_p, logs_p, x_mask = gen.enc_p(x, x_lengths, g=g)
 
         if gen.use_sdp:
             logw = gen.dp(x_enc, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
