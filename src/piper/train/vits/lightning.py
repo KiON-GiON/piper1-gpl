@@ -37,6 +37,171 @@ from .stft_loss import MultiResolutionSTFTLoss
 _LOGGER = logging.getLogger(__name__)
 
 
+_DP_ONLY_SUBKEYS = (
+    "conv_1.",
+    "norm_1.",
+    "conv_2.",
+    "norm_2.",
+)
+
+_SDP_ONLY_SUBKEYS = (
+    "log_flow.",
+    "flows.",
+    "post_pre.",
+    "post_proj.",
+    "post_convs.",
+    "post_flows.",
+    "pre.",
+    "convs.",
+)
+
+_SHARED_DUR_SUBKEYS = (
+    "proj.",
+    "cond.",
+)
+
+
+@dataclass
+class _DurationCkptLayout:
+    kind: str  # "split", "legacy_dp", "legacy_sdp", "none", "ambiguous"
+    dp_direct_hits: int = 0
+    dp_to_sdp_hits: int = 0
+    dp_only_count: int = 0
+    sdp_only_count: int = 0
+    total_dp_keys: int = 0
+    reason: str = ""
+
+
+def _subkey_after_prefix(name: str, prefix: str) -> str | None:
+    if not name.startswith(prefix):
+        return None
+    return name[len(prefix):]
+
+
+def _count_subkeys(keys, prefix: str, patterns) -> int:
+    count = 0
+    for k in keys:
+        sub = _subkey_after_prefix(k, prefix)
+        if sub is None:
+            continue
+        if any(sub.startswith(p) for p in patterns):
+            count += 1
+    return count
+
+
+def _count_shape_hits(src_state: dict, dst_state: dict, src_prefix: str, dst_prefix: str) -> tuple[int, int]:
+    hits = 0
+    total = 0
+    for k, v in src_state.items():
+        if not k.startswith(src_prefix):
+            continue
+        total += 1
+        dst_k = dst_prefix + k[len(src_prefix):]
+        if dst_k in dst_state and tuple(dst_state[dst_k].shape) == tuple(v.shape):
+            hits += 1
+    return hits, total
+
+
+def _inspect_duration_checkpoint_layout(
+    src_state: dict[str, torch.Tensor],
+    dst_state: dict[str, torch.Tensor],
+) -> _DurationCkptLayout:
+    keys = list(src_state.keys())
+
+    has_explicit_sdp = any(k.startswith("sdp.") for k in keys)
+    has_dp = any(k.startswith("dp.") for k in keys)
+
+    if not has_dp and not has_explicit_sdp:
+        return _DurationCkptLayout(kind="none", reason="No dp.* or sdp.* keys found")
+
+    if has_explicit_sdp:
+        return _DurationCkptLayout(
+            kind="split",
+            reason="Checkpoint already contains explicit sdp.* namespace",
+        )
+
+    dp_only_count = _count_subkeys(keys, "dp.", _DP_ONLY_SUBKEYS)
+    sdp_only_count = _count_subkeys(keys, "dp.", _SDP_ONLY_SUBKEYS)
+
+    dp_direct_hits, total_dp_keys = _count_shape_hits(src_state, dst_state, "dp.", "dp.")
+    dp_to_sdp_hits, _ = _count_shape_hits(src_state, dst_state, "dp.", "sdp.")
+
+    if (dp_only_count > 0) and (sdp_only_count == 0):
+        return _DurationCkptLayout(
+            kind="legacy_dp",
+            dp_direct_hits=dp_direct_hits,
+            dp_to_sdp_hits=dp_to_sdp_hits,
+            dp_only_count=dp_only_count,
+            sdp_only_count=sdp_only_count,
+            total_dp_keys=total_dp_keys,
+            reason="Found DP-exclusive keys under dp.*",
+        )
+
+    if (sdp_only_count > 0) and (dp_only_count == 0):
+        return _DurationCkptLayout(
+            kind="legacy_sdp",
+            dp_direct_hits=dp_direct_hits,
+            dp_to_sdp_hits=dp_to_sdp_hits,
+            dp_only_count=dp_only_count,
+            sdp_only_count=sdp_only_count,
+            total_dp_keys=total_dp_keys,
+            reason="Found SDP-exclusive keys under dp.*",
+        )
+
+    if (dp_to_sdp_hits > 0) and (dp_direct_hits == 0):
+        return _DurationCkptLayout(
+            kind="legacy_sdp",
+            dp_direct_hits=dp_direct_hits,
+            dp_to_sdp_hits=dp_to_sdp_hits,
+            dp_only_count=dp_only_count,
+            sdp_only_count=sdp_only_count,
+            total_dp_keys=total_dp_keys,
+            reason="dp.* keys match target sdp.* by shape, not target dp.*",
+        )
+
+    if (dp_direct_hits > 0) and (dp_to_sdp_hits == 0):
+        return _DurationCkptLayout(
+            kind="legacy_dp",
+            dp_direct_hits=dp_direct_hits,
+            dp_to_sdp_hits=dp_to_sdp_hits,
+            dp_only_count=dp_only_count,
+            sdp_only_count=sdp_only_count,
+            total_dp_keys=total_dp_keys,
+            reason="dp.* keys match target dp.* by shape, not target sdp.*",
+        )
+
+    if dp_to_sdp_hits > dp_direct_hits * 2:
+        return _DurationCkptLayout(
+            kind="legacy_sdp",
+            dp_direct_hits=dp_direct_hits,
+            dp_to_sdp_hits=dp_to_sdp_hits,
+            dp_only_count=dp_only_count,
+            sdp_only_count=sdp_only_count,
+            total_dp_keys=total_dp_keys,
+            reason="dp.* -> sdp.* has clearly more shape matches",
+        )
+
+    if dp_direct_hits > dp_to_sdp_hits * 2:
+        return _DurationCkptLayout(
+            kind="legacy_dp",
+            dp_direct_hits=dp_direct_hits,
+            dp_to_sdp_hits=dp_to_sdp_hits,
+            dp_only_count=dp_only_count,
+            sdp_only_count=sdp_only_count,
+            total_dp_keys=total_dp_keys,
+            reason="dp.* kept as dp.* has clearly more shape matches",
+        )
+
+    return _DurationCkptLayout(
+        kind="ambiguous",
+        dp_direct_hits=dp_direct_hits,
+        dp_to_sdp_hits=dp_to_sdp_hits,
+        dp_only_count=dp_only_count,
+        sdp_only_count=sdp_only_count,
+        total_dp_keys=total_dp_keys,
+        reason="Could not reliably infer whether legacy dp.* is DP or SDP",
+    )
+
 @dataclass
 class _ForwardPack:
     y: torch.Tensor
@@ -386,27 +551,19 @@ class VitsModel(L.LightningModule):
         model_has_sdp = any(k.startswith("sdp.") for k in model_state.keys())
         ckpt_has_sdp = any(k.startswith("sdp.") for k in normalized_state.keys())
 
-        ckpt_old_sdp_under_dp = (
-            model_has_sdp
-            and (not ckpt_has_sdp)
-            and any(
-                k.startswith("dp.log_flow")
-                or k.startswith("dp.flows.")
-                or k.startswith("dp.post_pre.")
-                or k.startswith("dp.post_proj.")
-                or k.startswith("dp.post_convs.")
-                or k.startswith("dp.post_flows.")
-                or k.startswith("dp.pre.")
-                or k.startswith("dp.proj.")
-                or k.startswith("dp.convs.")
-                for k in normalized_state.keys()
-            )
-        )
+        duration_layout = _inspect_duration_checkpoint_layout(normalized_state, model_state)
 
-        if ckpt_old_sdp_under_dp:
-            _LOGGER.info(
-                "init_from_checkpoint: detected legacy checkpoint with SDP stored under dp.*"
-            )
+        _LOGGER.info(
+            "init_from_checkpoint: duration layout=%s | reason=%s | "
+            "dp_direct_hits=%s | dp_to_sdp_hits=%s | dp_only=%s | sdp_only=%s | total_dp_keys=%s",
+            duration_layout.kind,
+            duration_layout.reason,
+            duration_layout.dp_direct_hits,
+            duration_layout.dp_to_sdp_hits,
+            duration_layout.dp_only_count,
+            duration_layout.sdp_only_count,
+            duration_layout.total_dp_keys,
+        )
 
         ckpt_has_speaker_emb = any("emb_g" in k for k in normalized_state.keys())
         model_is_multispeaker = self.hparams.num_speakers > 1
@@ -428,7 +585,7 @@ class VitsModel(L.LightningModule):
         for name, param in normalized_state.items():
             original_name = name
 
-            if ckpt_old_sdp_under_dp and name.startswith("dp."):
+            if duration_layout.kind == "legacy_sdp" and name.startswith("dp."):
                 mapped_name = "sdp." + name[3:]
                 if (mapped_name in model_state) and (model_state[mapped_name].shape == param.shape):
                     name = mapped_name
