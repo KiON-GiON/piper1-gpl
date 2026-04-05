@@ -680,11 +680,21 @@ class SynthesizerTrnVits2(nn.Module):
         w = attn.sum(2)  # [b, 1, t_x]
         logw_ = torch.log(w + 1e-6) * x_mask
 
+        logw_sdp = None
         if self.use_sdp:
             l_length_sdp = self.sdp(hidden_x, x_mask, w, g=g)
             l_length_sdp = l_length_sdp / torch.sum(x_mask)
 
             logw = self.dp(hidden_x, x_mask, g=g)
+
+            logw_sdp = self.sdp(
+                hidden_x,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=1.0,
+            )
+
             l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
 
             l_length = l_length_sdp + l_length_dp
@@ -706,7 +716,7 @@ class SynthesizerTrnVits2(nn.Module):
             x_mask,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
-            (hidden_x, logw, logw_, g),
+            (hidden_x, logw, logw_, logw_sdp, g),
             decoder_aux,
         )
 

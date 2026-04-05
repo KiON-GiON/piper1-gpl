@@ -215,7 +215,7 @@ class _ForwardPack:
     m_p: torch.Tensor
     logs_p: torch.Tensor
     logs_q: torch.Tensor
-    extra: Optional[
+    extra: Optional[Any] = None
         Tuple[
             torch.Tensor,
             torch.Tensor,
@@ -274,6 +274,8 @@ class VitsModel(L.LightningModule):
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
         vits2_infer_sdp_ratio: float = 0.2,
+        vits2_use_sdp_recon_loss: bool = True,
+        vits2_sdp_recon_loss_weight: float = 1.0,
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
@@ -745,12 +747,21 @@ class VitsModel(L.LightningModule):
 
         if extra is not None:
             try:
-                if len(extra) == 4:
-                    hidden_x, logw, logw_, g = extra
+                if len(extra) == 5:
+                    hidden_x, logw_dp, logw_target, logw_sdp, g = extra
+                elif len(extra) == 4:
+                    hidden_x, logw_dp, logw_target, g = extra
+                    logw_sdp = None
                 else:
-                    hidden_x, logw, logw_ = extra
-                    g = None
-                extra = (hidden_x, logw, logw_, g)
+                    raise ValueError("Unexpected extra tuple length")
+
+                extra = {
+                    "hidden_x": hidden_x,
+                    "logw_dp": logw_dp,
+                    "logw_target": logw_target,
+                    "logw_sdp": logw_sdp,
+                    "g": g,
+                }
             except Exception:
                 extra = None
 
@@ -796,33 +807,78 @@ class VitsModel(L.LightningModule):
             loss_fixed = loss_mel + loss_dur + loss_kl
         return loss_fixed, loss_mel, loss_dur, loss_kl
 
-    def _loss_d_dur(
-        self,
-        extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
-        x_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_x, logw, logw_, g = extra
+    def _loss_d_dur(self, extra: dict, x_mask: torch.Tensor) -> torch.Tensor:
+        hidden_x = extra["hidden_x"]
+        logw_dp = extra["logw_dp"]
+        logw_target = extra["logw_target"]
+        logw_sdp = extra.get("logw_sdp", None)
+        g = extra.get("g", None)
+
+        g_det = g.detach() if g is not None else None
+        x_mask_det = x_mask.detach()
+
+        losses = []
+
         y_dur_r, y_dur_g = self.model_dur(
             hidden_x.detach(),
-            x_mask.detach(),
-            logw_.detach(),
-            logw.detach(),
-            g.detach() if g is not None else None,
+            x_mask_det,
+            logw_target.detach(),
+            logw_dp.detach(),
+            g_det,
         )
         with autocast(self.device.type, enabled=False):
-            loss_dur_disc, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask)
-        return loss_dur_disc
+            loss_dp, _, _ = masked_discriminator_loss(y_dur_r, y_dur_g, x_mask_det)
+        losses.append(loss_dp)
 
-    def _loss_g_dur(
-        self,
-        extra: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
-        x_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_x, logw, logw_, g = extra
-        _y_dur_r2, y_dur_g2 = self.model_dur(hidden_x, x_mask, logw_, logw, g)
+        if logw_sdp is not None:
+            y_dur_r_sdp, y_dur_g_sdp = self.model_dur(
+                hidden_x.detach(),
+                x_mask_det,
+                logw_target.detach(),
+                logw_sdp.detach(),
+                g_det,
+            )
+            with autocast(self.device.type, enabled=False):
+                loss_sdp, _, _ = masked_discriminator_loss(
+                    y_dur_r_sdp, y_dur_g_sdp, x_mask_det
+                )
+            losses.append(loss_sdp)
+
+        return sum(losses) / len(losses)
+
+    def _loss_g_dur(self, extra: dict, x_mask: torch.Tensor) -> torch.Tensor:
+        hidden_x = extra["hidden_x"]
+        logw_dp = extra["logw_dp"]
+        logw_target = extra["logw_target"]
+        logw_sdp = extra.get("logw_sdp", None)
+        g = extra.get("g", None)
+
+        losses = []
+
+        _y_dur_r_dp, y_dur_g_dp = self.model_dur(
+            hidden_x,
+            x_mask,
+            logw_target,
+            logw_dp,
+            g,
+        )
         with autocast(self.device.type, enabled=False):
-            loss_dur_gen, _ = masked_generator_loss(y_dur_g2, x_mask)
-        return loss_dur_gen
+            loss_dp, _ = masked_generator_loss(y_dur_g_dp, x_mask)
+        losses.append(loss_dp)
+
+        if logw_sdp is not None:
+            _y_dur_r_sdp, y_dur_g_sdp = self.model_dur(
+                hidden_x,
+                x_mask,
+                logw_target,
+                logw_sdp,
+                g,
+            )
+            with autocast(self.device.type, enabled=False):
+                loss_sdp, _ = masked_generator_loss(y_dur_g_sdp, x_mask)
+            losses.append(loss_sdp)
+
+        return sum(losses) / len(losses)
 
     def _loss_g_subband(self, y: torch.Tensor, decoder_aux: Optional[Any]):
         if not self._use_subband_loss:
@@ -851,6 +907,27 @@ class VitsModel(L.LightningModule):
         with autocast(self.device.type, enabled=False):
             sc_loss, mag_loss = self.subband_stft_loss(y_hat_mb.float(), y_mb.float())
             return (sc_loss + mag_loss) * float(self.hparams.subband_stft_loss_weight)
+
+    def _loss_g_sdp_recon(self, extra: Optional[dict], x_mask: torch.Tensor):
+        if (
+            extra is None
+            or not getattr(self.hparams, "vits2_use_sdp_recon_loss", False)
+        ):
+            return None
+
+        logw_sdp = extra.get("logw_sdp", None)
+        if logw_sdp is None:
+            return None
+
+        logw_target = extra["logw_target"]
+
+        with autocast(self.device.type, enabled=False):
+            mask = x_mask.float()
+            denom = torch.sum(mask).clamp_min(1.0)
+            loss = torch.sum(((logw_sdp.float() - logw_target.float()) ** 2) * mask) / denom
+            loss = loss * float(self.hparams.vits2_sdp_recon_loss_weight)
+
+        return loss
 
     def training_step(self, batch: Batch, batch_idx: int):
         opts = self.optimizers()
@@ -908,6 +985,12 @@ class VitsModel(L.LightningModule):
         loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
         loss_fixed, loss_mel, loss_dur, loss_kl = self._loss_g_fixed_terms(pack)
         loss_g = loss_adv_fm + loss_fixed
+
+        loss_sdp_rec = self._loss_g_sdp_recon(pack.extra, pack.x_mask)
+        if loss_sdp_rec is not None:
+            loss_g = loss_g + loss_sdp_rec
+            self.log("loss_sdp_rec", loss_sdp_rec, batch_size=batch_size)
+
         loss_subband = self._loss_g_subband(pack.y, pack.decoder_aux)
         if loss_subband is not None:
             loss_g = loss_g + loss_subband
@@ -938,6 +1021,11 @@ class VitsModel(L.LightningModule):
             loss_adv_fm = self._loss_g_audio_adv_fm(pack.y, pack.y_hat)
             loss_fixed, _loss_mel, _loss_dur, _loss_kl = self._loss_g_fixed_terms(pack)
             val_loss = loss_adv_fm + loss_fixed
+
+            loss_sdp_rec = self._loss_g_sdp_recon(pack.extra, pack.x_mask)
+            if loss_sdp_rec is not None:
+                val_loss = val_loss + loss_sdp_rec
+                self.log("val_loss_sdp_rec", loss_sdp_rec, batch_size=batch_size)
 
             loss_subband = self._loss_g_subband(pack.y, pack.decoder_aux)
             if loss_subband is not None:
