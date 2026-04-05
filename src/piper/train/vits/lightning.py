@@ -99,9 +99,6 @@ class VitsModel(L.LightningModule):
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
-        vits2_use_dp: bool = False,
-        vits2_dp_noise_channels: int = 1,
-        vits2_dp_train_noise_scale: float = 1.0,
         log_vits2_features: bool = True,
         # training
         learning_rate: float = 2e-4,
@@ -231,9 +228,6 @@ class VitsModel(L.LightningModule):
                     vits2_use_noise_scaled_mas=self.hparams.vits2_use_noise_scaled_mas,
                     vits2_mas_noise_scale_initial=self.hparams.vits2_mas_noise_scale_initial,
                     vits2_noise_scale_delta=self.hparams.vits2_noise_scale_delta,
-                    vits2_use_dp=self.hparams.vits2_use_dp,
-                    vits2_dp_noise_channels=self.hparams.vits2_dp_noise_channels,
-                    vits2_dp_train_noise_scale=self.hparams.vits2_dp_train_noise_scale,
                 )
             )
 
