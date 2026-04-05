@@ -576,7 +576,7 @@ class VitsModel(L.LightningModule):
         y_hat = y_hat[..., : y_slice.shape[-1]]
 
         y_hat_mel = mel_spectrogram_torch(
-            y_hat.squeeze(1),
+            y_hat.squeeze(1).float(),
             self.hparams.filter_length,
             self.hparams.mel_channels,
             self.hparams.sample_rate,
