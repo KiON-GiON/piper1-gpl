@@ -216,13 +216,6 @@ class _ForwardPack:
     logs_p: torch.Tensor
     logs_q: torch.Tensor
     extra: Optional[Any] = None
-        Tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            Optional[torch.Tensor],
-        ]
-    ] = None
     decoder_aux: Optional[Any] = None
 
 
