@@ -283,6 +283,8 @@ class VitsModel(L.LightningModule):
         periodicity_use_uv: bool = True,
         periodicity_use_noise: bool = False,
         periodicity_noise_std: float = 0.003,
+        pitch_decoder_gt_ratio: float = 0.8,
+        pitch_decoder_warmup_steps: int = 0,
         log_vits2_features: bool = True,
         # Decoder + subbands
         decoder_type: Optional[str] = None,
@@ -497,6 +499,8 @@ class VitsModel(L.LightningModule):
                     vits2_periodicity_use_uv=self.hparams.periodicity_use_uv,
                     vits2_periodicity_use_noise=self.hparams.periodicity_use_noise,
                     vits2_periodicity_noise_std=self.hparams.periodicity_noise_std,
+                    vits2_pitch_decoder_gt_ratio=self.hparams.pitch_decoder_gt_ratio,
+                    vits2_pitch_decoder_warmup_steps=self.hparams.pitch_decoder_warmup_steps,
                 )
             )
 
@@ -749,6 +753,9 @@ class VitsModel(L.LightningModule):
             logf0 = logf0.unsqueeze(1)
         if uv is not None and uv.dim() == 2:
             uv = uv.unsqueeze(1)
+
+        if hasattr(self.model_g, "set_pitch_decoder_mix_step"):
+            self.model_g.set_pitch_decoder_mix_step(self._mas_batch_step)
 
         out = self.model_g(x, x_lengths, y_in, spec_lengths, speaker_ids, pitch=logf0, uv=uv)
 

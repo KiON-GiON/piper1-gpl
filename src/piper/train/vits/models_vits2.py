@@ -587,6 +587,8 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_periodicity_use_uv: bool = True,
         vits2_periodicity_use_noise: bool = False,
         vits2_periodicity_noise_std: float = 0.003,
+        vits2_pitch_decoder_gt_ratio: float = 0.8,
+        vits2_pitch_decoder_warmup_steps: int = 0,
         # Decoder type + subbands
         decoder_type: str | None = None,
         istft_vits: bool = False,
@@ -626,6 +628,9 @@ class SynthesizerTrnVits2(nn.Module):
         self.vits2_infer_sdp_ratio = float(vits2_infer_sdp_ratio)
 
         self.vits2_use_explicit_pitch = bool(vits2_use_explicit_pitch)
+        self.vits2_pitch_decoder_gt_ratio = float(vits2_pitch_decoder_gt_ratio)
+        self.vits2_pitch_decoder_warmup_steps = int(vits2_pitch_decoder_warmup_steps)
+        self._pitch_decoder_mix_step = 0
 
         self.pitch_predictor = None
         if self.vits2_use_explicit_pitch:
@@ -748,6 +753,34 @@ class SynthesizerTrnVits2(nn.Module):
 
         return audio, decoder_aux
 
+    def set_pitch_decoder_mix_step(self, step: int):
+        self._pitch_decoder_mix_step = int(step)
+
+    def _current_pitch_decoder_gt_ratio(self) -> float:
+        if (
+            self.vits2_pitch_decoder_warmup_steps > 0
+            and self._pitch_decoder_mix_step < self.vits2_pitch_decoder_warmup_steps
+        ):
+            return 1.0
+
+        return max(0.0, min(1.0, float(self.vits2_pitch_decoder_gt_ratio)))
+
+    def _choose_decoder_pitch_cond(self, gt_pitch_cond, pred_pitch_cond):
+        if gt_pitch_cond is None:
+            return pred_pitch_cond, False, 0.0
+
+        if pred_pitch_cond is None:
+            return gt_pitch_cond, False, 1.0
+
+        gt_ratio = self._current_pitch_decoder_gt_ratio()
+        dev = gt_pitch_cond["logf0"].device
+        use_pred = bool((torch.rand((), device=dev) >= gt_ratio).item())
+
+        if use_pred:
+            return pred_pitch_cond, True, gt_ratio
+
+        return gt_pitch_cond, False, gt_ratio
+
     def forward(self, x, x_lengths, y, y_lengths, sid=None, pitch=None, uv=None):
         from . import monotonic_align
 
@@ -819,15 +852,40 @@ class SynthesizerTrnVits2(nn.Module):
         z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
 
         pitch_cond = None
+        pitch_decoder_used_pred = False
+        pitch_decoder_gt_ratio = 1.0
+
         if self.vits2_use_explicit_pitch:
+            gt_pitch_cond = None
+            pred_pitch_cond = None
+
             if (pitch is not None) and (uv is not None):
-                pitch_cond = self._build_pitch_cond(pitch, uv, ids_slice=ids_slice)
-            elif (pitch_pred_logf0 is not None) and (pitch_pred_uv_logits is not None):
-                pitch_cond = self._build_pitch_cond(
-                    pitch_pred_logf0,
-                    torch.sigmoid(pitch_pred_uv_logits),
+                gt_pitch_cond = self._build_pitch_cond(
+                    pitch,
+                    uv,
                     ids_slice=ids_slice,
                 )
+
+            if (pitch_pred_logf0 is not None) and (pitch_pred_uv_logits is not None):
+                pred_pitch_cond = self._build_pitch_cond(
+                    pitch_pred_logf0.detach(),
+                    torch.sigmoid(pitch_pred_uv_logits).detach(),
+                    ids_slice=ids_slice,
+                )
+
+            if self.training:
+                pitch_cond, pitch_decoder_used_pred, pitch_decoder_gt_ratio = (
+                    self._choose_decoder_pitch_cond(gt_pitch_cond, pred_pitch_cond)
+                )
+            else:
+                if gt_pitch_cond is not None:
+                    pitch_cond = gt_pitch_cond
+                    pitch_decoder_used_pred = False
+                    pitch_decoder_gt_ratio = 1.0
+                else:
+                    pitch_cond = pred_pitch_cond
+                    pitch_decoder_used_pred = pred_pitch_cond is not None
+                    pitch_decoder_gt_ratio = 0.0
 
         o, decoder_aux = self._decode(z_slice, g=g, pitch_cond=pitch_cond)
 
@@ -842,6 +900,12 @@ class SynthesizerTrnVits2(nn.Module):
             "pitch_gt_logf0": pitch,
             "pitch_gt_uv": uv,
             "pitch_mask": y_mask,
+            "pitch_decoder_used_pred": torch.tensor(
+                float(pitch_decoder_used_pred), device=hidden_x.device
+            ),
+            "pitch_decoder_gt_ratio": torch.tensor(
+                float(pitch_decoder_gt_ratio), device=hidden_x.device
+            ),
         }
 
         return (
