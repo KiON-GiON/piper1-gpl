@@ -33,6 +33,7 @@ from .duration_discriminators import build_duration_discriminator
 from .decoder_factory import resolve_decoder_type, decoder_output_hop_length
 from .pqmf import PQMF
 from .stft_loss import MultiResolutionSTFTLoss
+from .ssl_losses import WavLMFeatureLoss
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -272,6 +273,16 @@ class VitsModel(L.LightningModule):
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
+        # Pitch
+        use_explicit_pitch: bool = False,
+        pitch_loss_f0_weight: float = 1.0,
+        pitch_loss_uv_weight: float = 1.0,
+        pitch_predictor_layers: int = 5,
+        pitch_predictor_kernel_size: int = 5,
+        pitch_predictor_dropout: float = 0.3,
+        periodicity_use_uv: bool = True,
+        periodicity_use_noise: bool = False,
+        periodicity_noise_std: float = 0.003,
         log_vits2_features: bool = True,
         # Decoder + subbands
         decoder_type: Optional[str] = None,
@@ -286,6 +297,13 @@ class VitsModel(L.LightningModule):
         subband_stft_fft_sizes=(384, 683, 171),
         subband_stft_hop_sizes=(30, 60, 10),
         subband_stft_win_lengths=(150, 300, 60),
+        # SSL
+        use_ssl_perceptual_loss: bool = False,
+        ssl_model_name: str = "microsoft/wavlm-base-plus",
+        ssl_sample_rate: int = 16000,
+        ssl_feature_layers=(1, 2, 3, 6, 7, 8),
+        ssl_loss_weight: float = 1.0,
+        ssl_start_step: int = 0,
         # training
         learning_rate: float = 2e-4,
         learning_rate_d: float = 1e-4,
@@ -354,6 +372,12 @@ class VitsModel(L.LightningModule):
             gen_istft_hop_size=self.hparams.gen_istft_hop_size,
             subbands=self.hparams.subbands,
         )
+
+        if expected_hop_length != self.hparams.hop_length:
+            raise ValueError(
+                f"Incompatible hop_length: dataset/model hop_length={self.hparams.hop_length}, "
+                f"but decoder_type={effective_decoder_type} implies {expected_hop_length}"
+            )
 
         self._effective_decoder_type = effective_decoder_type
 
@@ -465,6 +489,14 @@ class VitsModel(L.LightningModule):
                     gen_istft_n_fft=self.hparams.gen_istft_n_fft,
                     gen_istft_hop_size=self.hparams.gen_istft_hop_size,
                     subbands=self.hparams.subbands,
+                    sample_rate=self.hparams.sample_rate,
+                    vits2_use_explicit_pitch=self.hparams.use_explicit_pitch,
+                    vits2_pitch_predictor_layers=self.hparams.pitch_predictor_layers,
+                    vits2_pitch_predictor_kernel_size=self.hparams.pitch_predictor_kernel_size,
+                    vits2_pitch_predictor_dropout=self.hparams.pitch_predictor_dropout,
+                    vits2_periodicity_use_uv=self.hparams.periodicity_use_uv,
+                    vits2_periodicity_use_noise=self.hparams.periodicity_use_noise,
+                    vits2_periodicity_noise_std=self.hparams.periodicity_noise_std,
                 )
             )
 
@@ -496,12 +528,30 @@ class VitsModel(L.LightningModule):
                 gin_channels=dur_gin_channels,
             )
 
+        self.ssl_feature_loss = None
+        if self.hparams.use_ssl_perceptual_loss:
+            self.ssl_feature_loss = WavLMFeatureLoss(
+                model_name=self.hparams.ssl_model_name,
+                source_sr=self.hparams.sample_rate,
+                target_sr=self.hparams.ssl_sample_rate,
+                layers=tuple(self.hparams.ssl_feature_layers),
+            )
+
         if init_from_checkpoint:
             self._load_generator_weights(init_from_checkpoint)
             self.hparams.init_from_checkpoint = None
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         checkpoint["mas_batch_step"] = int(self._mas_batch_step)
+
+        state_dict = checkpoint.get("state_dict", None)
+        if state_dict is not None:
+            drop_prefixes = (
+                "ssl_feature_loss."
+            )
+            for key in list(state_dict.keys()):
+                if key.startswith(drop_prefixes):
+                    del state_dict[key]
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         self._mas_batch_step = int(checkpoint.get("mas_batch_step", 0))
@@ -692,7 +742,15 @@ class VitsModel(L.LightningModule):
                 self.hparams.mel_fmax,
             )
 
-        out = self.model_g(x, x_lengths, y_in, spec_lengths, speaker_ids)
+        logf0 = getattr(batch, "log_f0", None)
+        uv = getattr(batch, "voiced", None)
+
+        if logf0 is not None and logf0.dim() == 2:
+            logf0 = logf0.unsqueeze(1)
+        if uv is not None and uv.dim() == 2:
+            uv = uv.unsqueeze(1)
+
+        out = self.model_g(x, x_lengths, y_in, spec_lengths, speaker_ids, pitch=logf0, uv=uv)
 
         extra = None
         decoder_aux = None
@@ -739,24 +797,27 @@ class VitsModel(L.LightningModule):
         )
 
         if extra is not None:
-            try:
-                if len(extra) == 5:
-                    hidden_x, logw_dp, logw_target, logw_sdp, g = extra
-                elif len(extra) == 4:
-                    hidden_x, logw_dp, logw_target, g = extra
-                    logw_sdp = None
-                else:
-                    raise ValueError("Unexpected extra tuple length")
+            if isinstance(extra, dict):
+                pass
+            else:
+                try:
+                    if len(extra) == 5:
+                        hidden_x, logw_dp, logw_target, logw_sdp, g = extra
+                    elif len(extra) == 4:
+                        hidden_x, logw_dp, logw_target, g = extra
+                        logw_sdp = None
+                    else:
+                        raise ValueError("Unexpected extra tuple length")
 
-                extra = {
-                    "hidden_x": hidden_x,
-                    "logw_dp": logw_dp,
-                    "logw_target": logw_target,
-                    "logw_sdp": logw_sdp,
-                    "g": g,
-                }
-            except Exception:
-                extra = None
+                    extra = {
+                        "hidden_x": hidden_x,
+                        "logw_dp": logw_dp,
+                        "logw_target": logw_target,
+                        "logw_sdp": logw_sdp,
+                        "g": g,
+                    }
+                except Exception:
+                    extra = None
 
         return _ForwardPack(
             y=y_slice,
@@ -922,6 +983,53 @@ class VitsModel(L.LightningModule):
 
         return loss
 
+    def _loss_g_pitch(self, extra: Optional[dict]):
+        if extra is None:
+            return None, None, None
+
+        pred_logf0 = extra.get("pitch_pred_logf0", None)
+        pred_uv_logits = extra.get("pitch_pred_uv_logits", None)
+        gt_logf0 = extra.get("pitch_gt_logf0", None)
+        gt_uv = extra.get("pitch_gt_uv", None)
+        pitch_mask = extra.get("pitch_mask", None)
+
+        if any(v is None for v in [pred_logf0, pred_uv_logits, gt_logf0, gt_uv, pitch_mask]):
+            return None, None, None
+
+        with autocast(self.device.type, enabled=False):
+            mask = pitch_mask.float()
+            gt_uv = gt_uv.float()
+            pred_uv_logits = pred_uv_logits.float()
+            pred_logf0 = pred_logf0.float()
+            gt_logf0 = gt_logf0.float()
+
+            denom_uv = torch.sum(mask).clamp_min(1.0)
+            uv_loss = F.binary_cross_entropy_with_logits(
+                pred_uv_logits, gt_uv, reduction="none"
+            )
+            uv_loss = torch.sum(uv_loss * mask) / denom_uv
+
+            voiced_mask = mask * gt_uv
+            denom_f0 = torch.sum(voiced_mask).clamp_min(1.0)
+            f0_loss = torch.sum(torch.abs(pred_logf0 - gt_logf0) * voiced_mask) / denom_f0
+
+            total = (
+                float(self.hparams.pitch_loss_f0_weight) * f0_loss
+                + float(self.hparams.pitch_loss_uv_weight) * uv_loss
+            )
+
+        return total, f0_loss, uv_loss
+
+    def _loss_g_ssl(self, y: torch.Tensor, y_hat: torch.Tensor):
+        if self.ssl_feature_loss is None:
+            return None
+
+        if int(self.global_step) < int(getattr(self.hparams, "ssl_start_step", 0)):
+            return None
+
+        with autocast(self.device.type, enabled=False):
+            return self.ssl_feature_loss(y.float(), y_hat.float()) * float(self.hparams.ssl_loss_weight)
+
     def training_step(self, batch: Batch, batch_idx: int):
         opts = self.optimizers()
         if not isinstance(opts, (list, tuple)):
@@ -989,6 +1097,18 @@ class VitsModel(L.LightningModule):
             loss_g = loss_g + loss_subband
             self.log("loss_subband", loss_subband, batch_size=batch_size)
 
+        loss_pitch, loss_pitch_f0, loss_pitch_uv = self._loss_g_pitch(pack.extra)
+        if loss_pitch is not None:
+            loss_g = loss_g + loss_pitch
+            self.log("loss_pitch", loss_pitch, batch_size=batch_size)
+            self.log("loss_pitch_f0", loss_pitch_f0, batch_size=batch_size)
+            self.log("loss_pitch_uv", loss_pitch_uv, batch_size=batch_size)
+
+        loss_ssl = self._loss_g_ssl(pack.y, pack.y_hat)
+        if loss_ssl is not None:
+            loss_g = loss_g + loss_ssl
+            self.log("loss_ssl", loss_ssl, batch_size=batch_size)
+
         if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
             loss_g = loss_g + self._loss_g_dur(pack.extra, pack.x_mask)
 
@@ -1024,6 +1144,18 @@ class VitsModel(L.LightningModule):
             if loss_subband is not None:
                 val_loss = val_loss + loss_subband
                 self.log("val_loss_subband", loss_subband, batch_size=batch_size)
+
+            loss_pitch, loss_pitch_f0, loss_pitch_uv = self._loss_g_pitch(pack.extra)
+            if loss_pitch is not None:
+                val_loss = val_loss + loss_pitch
+                self.log("val_loss_pitch", loss_pitch, batch_size=batch_size)
+                self.log("val_loss_pitch_f0", loss_pitch_f0, batch_size=batch_size)
+                self.log("val_loss_pitch_uv", loss_pitch_uv, batch_size=batch_size)
+
+            loss_ssl = self._loss_g_ssl(pack.y, pack.y_hat)
+            if loss_ssl is not None:
+                val_loss = val_loss + loss_ssl
+                self.log("val_loss_ssl", loss_ssl, batch_size=batch_size)
 
             if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
                 val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask)

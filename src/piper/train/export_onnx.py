@@ -55,7 +55,14 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint)
 
     # pylint: disable=no-value-for-parameter
-    model = VitsModel.load_from_checkpoint(checkpoint_path, map_location="cpu")
+    model = VitsModel.load_from_checkpoint(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+            strict=False,
+        use_duration_discriminator=False,
+        use_ssl_perceptual_loss=False,
+    )
     model_g = model.model_g
 
     # Inference only

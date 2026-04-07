@@ -66,6 +66,11 @@ def build_decoder(
     gen_istft_hop_size: int = 4,
     subbands: int = 4,
     is_onnx: bool = False,
+    sample_rate: int = 22050,
+    use_explicit_pitch: bool = False,
+    periodicity_use_uv: bool = True,
+    periodicity_use_noise: bool = False,
+    periodicity_noise_std: float = 0.003,
 ):
     decoder_type = resolve_decoder_type(decoder_type=decoder_type)
 
@@ -94,6 +99,11 @@ def build_decoder(
         gen_istft_n_fft=gen_istft_n_fft,
         gen_istft_hop_size=gen_istft_hop_size,
         is_onnx=is_onnx,
+        sample_rate=sample_rate,
+        use_explicit_pitch=use_explicit_pitch,
+        periodicity_use_uv=periodicity_use_uv,
+        periodicity_use_noise=periodicity_use_noise,
+        periodicity_noise_std=periodicity_noise_std,
     )
 
     if decoder_type == "istft":

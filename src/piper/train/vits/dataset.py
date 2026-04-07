@@ -33,6 +33,8 @@ class CachedUtterance:
     phoneme_ids_path: Path
     audio_norm_path: Path
     audio_spec_path: Path
+    pitch_log_f0_path: Optional[Path] = None
+    pitch_voiced_path: Optional[Path] = None
     text: Optional[str] = None
     speaker_id: Optional[int] = None
 
@@ -61,6 +63,9 @@ class VitsDataModule(L.LightningDataModule):
         trim_silence: bool = True,
         keep_seconds_before_silence: float = 0.25,
         keep_seconds_after_silence: float = 0.25,
+        compute_pitch_features: bool = False,
+        pitch_fmin: float = 40.0,
+        pitch_fmax: float = 1100.0,
     ) -> None:
         super().__init__()
 
@@ -103,6 +108,75 @@ class VitsDataModule(L.LightningDataModule):
 
         self.piper_config: Optional[PiperConfig] = None
         self.is_multispeaker = self.num_speakers > 1
+
+        self.compute_pitch_features = compute_pitch_features
+        self.pitch_fmin = float(pitch_fmin)
+        self.pitch_fmax = float(pitch_fmax)
+
+    @staticmethod
+    def _fit_feature_length(
+        values: np.ndarray,
+        target_length: int,
+        pad_value: float = 0.0,
+    ) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32)
+
+        if values.shape[0] == target_length:
+            return values
+
+        if values.shape[0] > target_length:
+            return values[:target_length]
+
+        if values.shape[0] == 0:
+            return np.full((target_length,), pad_value, dtype=np.float32)
+
+        pad = np.full((target_length - values.shape[0],), pad_value, dtype=np.float32)
+        return np.concatenate([values, pad], axis=0)
+
+    def _extract_log_f0_and_voiced(
+        self,
+        audio_array: np.ndarray,
+        target_frames: int,
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        audio_array = np.asarray(audio_array, dtype=np.float64)
+
+        f0, voiced_flag, _voiced_prob = librosa.pyin(
+            audio_array,
+            fmin=self.pitch_fmin,
+            fmax=self.pitch_fmax,
+            sr=self.sample_rate,
+            frame_length=self.filter_length,
+            hop_length=self.hop_length,
+            center=False,
+            fill_na=np.nan,
+        )
+
+        if f0 is None:
+            f0 = np.zeros((0,), dtype=np.float32)
+            voiced_flag = np.zeros((0,), dtype=np.float32)
+
+        f0 = np.asarray(f0, dtype=np.float32)
+        voiced = np.asarray(voiced_flag, dtype=np.float32)
+
+        voiced = np.nan_to_num(voiced, nan=0.0, posinf=0.0, neginf=0.0)
+        finite_mask = np.isfinite(f0).astype(np.float32)
+        voiced = np.maximum(voiced, finite_mask)
+
+        f0 = np.nan_to_num(f0, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if np.any(voiced > 0.5):
+            voiced_idx = np.where(voiced > 0.5)[0]
+            cont_f0 = np.interp(np.arange(len(f0)), voiced_idx, f0[voiced_idx]).astype(np.float32)
+        else:
+            cont_f0 = np.zeros_like(f0, dtype=np.float32)
+
+        log_f0 = np.log(np.clip(cont_f0, a_min=1.0, a_max=None)).astype(np.float32)
+
+        log_pad_value = float(log_f0[-1]) if len(log_f0) > 0 else 0.0
+        log_f0 = self._fit_feature_length(log_f0, target_frames, pad_value=log_pad_value)
+        voiced = self._fit_feature_length(voiced, target_frames, pad_value=0.0)
+
+        return torch.FloatTensor(log_f0), torch.FloatTensor(voiced)
 
     def prepare_data(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -247,22 +321,47 @@ class VitsDataModule(L.LightningDataModule):
 
                 # mel spectrogram
                 audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
+                spec_tensor: Optional[torch.Tensor] = None
                 if not audio_spec_path.exists():
                     if audio_norm_tensor is None:
                         # Load audio from cache
                         audio_norm_tensor = torch.load(norm_audio_path)
 
-                    torch.save(
-                        spectrogram_torch(
-                            y=audio_norm_tensor.unsqueeze(0),
-                            n_fft=self.filter_length,
-                            sampling_rate=self.sample_rate,
-                            hop_size=self.hop_length,
-                            win_size=self.win_length,
-                            center=False,
-                        ).squeeze(0),
-                        audio_spec_path,
+                    spec_tensor = spectrogram_torch(
+                        y=audio_norm_tensor.unsqueeze(0),
+                        n_fft=self.filter_length,
+                        sampling_rate=self.sample_rate,
+                        hop_size=self.hop_length,
+                        win_size=self.win_length,
+                        center=False,
+                    ).squeeze(0)
+
+                    torch.save(spec_tensor, audio_spec_path)
+                    if report_prepare is None:
+                        report_prepare = True
+
+                # pitch features
+                pitch_log_f0_path = self.cache_dir / f"{cache_id}.log_f0.pt"
+                pitch_voiced_path = self.cache_dir / f"{cache_id}.voiced.pt"
+
+                if self.compute_pitch_features and (
+                    (not pitch_log_f0_path.exists()) or (not pitch_voiced_path.exists())
+                ):
+                    if audio_norm_tensor is None:
+                        audio_norm_tensor = torch.load(norm_audio_path)
+
+                    if spec_tensor is None:
+                        spec_tensor = torch.load(audio_spec_path)
+
+                    target_frames = int(spec_tensor.size(1))
+                    log_f0_tensor, voiced_tensor = self._extract_log_f0_and_voiced(
+                        audio_norm_tensor.cpu().numpy(),
+                        target_frames=target_frames,
                     )
+
+                    torch.save(log_f0_tensor, pitch_log_f0_path)
+                    torch.save(voiced_tensor, pitch_voiced_path)
+
                     if report_prepare is None:
                         report_prepare = True
 
@@ -342,6 +441,29 @@ class VitsDataModule(L.LightningDataModule):
                     )
                     continue
 
+                pitch_log_f0_path: Optional[Path] = None
+                pitch_voiced_path: Optional[Path] = None
+
+                if self.compute_pitch_features:
+                    pitch_log_f0_path = self.cache_dir / f"{cache_id}.log_f0.pt"
+                    pitch_voiced_path = self.cache_dir / f"{cache_id}.voiced.pt"
+
+                    if not pitch_log_f0_path.exists():
+                        _LOGGER.warning(
+                            "Missing log_f0 for %s: %s",
+                            audio_path,
+                            pitch_log_f0_path,
+                        )
+                        continue
+
+                    if not pitch_voiced_path.exists():
+                        _LOGGER.warning(
+                            "Missing voiced flags for %s: %s",
+                            audio_path,
+                            pitch_voiced_path,
+                        )
+                        continue
+
                 text: Optional[str] = None
                 text_path = self.cache_dir / f"{cache_id}.txt"
                 if text_path.exists():
@@ -352,6 +474,8 @@ class VitsDataModule(L.LightningDataModule):
                         phoneme_ids_path=phoneme_ids_path,
                         audio_norm_path=audio_norm_path,
                         audio_spec_path=audio_spec_path,
+                        pitch_log_f0_path=pitch_log_f0_path,
+                        pitch_voiced_path=pitch_voiced_path,
                         text=text,
                         speaker_id=speaker_id,
                     )
@@ -453,6 +577,8 @@ class UtteranceTensors:
     phoneme_ids: LongTensor
     spectrogram: FloatTensor
     audio_norm: FloatTensor
+    log_f0: Optional[FloatTensor] = None
+    voiced: Optional[FloatTensor] = None
     speaker_id: Optional[LongTensor] = None
     text: Optional[str] = None
 
@@ -470,6 +596,8 @@ class Batch:
     audios: FloatTensor
     audio_lengths: LongTensor
     speaker_ids: Optional[LongTensor] = None
+    log_f0: Optional[FloatTensor] = None
+    voiced: Optional[FloatTensor] = None
 
 
 class VitsDataset(Dataset):
@@ -485,6 +613,16 @@ class VitsDataset(Dataset):
             phoneme_ids=torch.load(utt.phoneme_ids_path),
             audio_norm=torch.load(utt.audio_norm_path),
             spectrogram=torch.load(utt.audio_spec_path),
+            log_f0=(
+                torch.load(utt.pitch_log_f0_path)
+                if utt.pitch_log_f0_path is not None
+                else None
+            ),
+            voiced=(
+                torch.load(utt.pitch_voiced_path)
+                if utt.pitch_voiced_path is not None
+                else None
+            ),
             speaker_id=(
                 LongTensor([utt.speaker_id]) if utt.speaker_id is not None else None
             ),
@@ -506,6 +644,13 @@ class UtteranceCollate:
         max_audio_length = 0
 
         num_mels = 0
+
+        has_pitch = any(utt.log_f0 is not None for utt in utterances)
+        if has_pitch:
+            assert all(
+                (utt.log_f0 is not None) and (utt.voiced is not None)
+                for utt in utterances
+            ), "Mixed pitch availability in batch"
 
         # Determine lengths
         for utt_idx, utt in enumerate(utterances):
@@ -535,6 +680,14 @@ class UtteranceCollate:
         phonemes_padded.zero_()
         spec_padded.zero_()
         audio_padded.zero_()
+
+        log_f0_padded: Optional[FloatTensor] = None
+        voiced_padded: Optional[FloatTensor] = None
+        if has_pitch:
+            log_f0_padded = FloatTensor(num_utterances, max_spec_length)
+            voiced_padded = FloatTensor(num_utterances, max_spec_length)
+            log_f0_padded.zero_()
+            voiced_padded.zero_()
 
         phoneme_lengths = LongTensor(num_utterances)
         spec_lengths = LongTensor(num_utterances)
@@ -567,6 +720,15 @@ class UtteranceCollate:
                 assert speaker_ids is not None
                 speaker_ids[utt_idx] = int(utt.speaker_id.item())
 
+            if has_pitch:
+                assert log_f0_padded is not None
+                assert voiced_padded is not None
+                assert utt.log_f0 is not None
+                assert utt.voiced is not None
+
+                log_f0_padded[utt_idx, :spec_length] = utt.log_f0[:spec_length]
+                voiced_padded[utt_idx, :spec_length] = utt.voiced[:spec_length]
+
         return Batch(
             phoneme_ids=phonemes_padded,
             phoneme_lengths=phoneme_lengths,
@@ -575,4 +737,6 @@ class UtteranceCollate:
             audios=audio_padded,
             audio_lengths=audio_lengths,
             speaker_ids=speaker_ids,
+            log_f0=log_f0_padded,
+            voiced=voiced_padded,
         )

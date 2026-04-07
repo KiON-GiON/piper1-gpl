@@ -17,6 +17,53 @@ from .attentions_vits2 import FFT as FFTBlock
 from .decoder_factory import build_decoder, resolve_decoder_type
 
 
+class PitchPredictor(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        kernel_size: int = 5,
+        n_layers: int = 5,
+        p_dropout: float = 0.3,
+        gin_channels: int = 0,
+    ):
+        super().__init__()
+        self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+        self.drop = nn.Dropout(p_dropout)
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for _ in range(n_layers):
+            self.convs.append(
+                nn.Conv1d(
+                    hidden_channels,
+                    hidden_channels,
+                    kernel_size,
+                    padding=kernel_size // 2,
+                )
+            )
+            self.norms.append(modules.LayerNorm(hidden_channels))
+
+        self.cond = nn.Conv1d(gin_channels, hidden_channels, 1) if gin_channels > 0 else None
+        self.proj_logf0 = nn.Conv1d(hidden_channels, 1, 1)
+        self.proj_uv = nn.Conv1d(hidden_channels, 1, 1)
+
+    def forward(self, x, x_mask, g=None):
+        h = self.pre(x) * x_mask
+        if (g is not None) and (self.cond is not None):
+            h = h + self.cond(g)
+
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(h * x_mask)
+            h = torch.relu(h)
+            h = norm(h)
+            h = self.drop(h)
+
+        logf0 = self.proj_logf0(h) * x_mask
+        uv_logits = self.proj_uv(h) * x_mask
+        return logf0, uv_logits
+
+
 class TextEncoderSpkConditioned(nn.Module):
     def __init__(
         self,
@@ -522,6 +569,7 @@ class SynthesizerTrnVits2(nn.Module):
         n_speakers: int = 1,
         gin_channels: int = 0,
         use_sdp: bool = True,
+        sample_rate: int = 22050,
         # VITS2 flags
         vits2_use_spk_conditioned_encoder: bool = False,
         vits2_cond_layer_idx: int = 2,
@@ -531,6 +579,14 @@ class SynthesizerTrnVits2(nn.Module):
         vits2_mas_noise_scale_initial: float = 0.01,
         vits2_noise_scale_delta: float = 2e-6,
         vits2_infer_sdp_ratio: float = 0.2,
+        # Pitch
+        vits2_use_explicit_pitch: bool = False,
+        vits2_pitch_predictor_layers: int = 5,
+        vits2_pitch_predictor_kernel_size: int = 5,
+        vits2_pitch_predictor_dropout: float = 0.3,
+        vits2_periodicity_use_uv: bool = True,
+        vits2_periodicity_use_noise: bool = False,
+        vits2_periodicity_noise_std: float = 0.003,
         # Decoder type + subbands
         decoder_type: str | None = None,
         istft_vits: bool = False,
@@ -553,6 +609,8 @@ class SynthesizerTrnVits2(nn.Module):
         self.gin_channels = gin_channels
         self.use_sdp = use_sdp
 
+        self.sample_rate = int(sample_rate)
+
         # VITS2 features
         self.vits2_use_spk_conditioned_encoder = bool(vits2_use_spk_conditioned_encoder)
         self.vits2_cond_layer_idx = int(vits2_cond_layer_idx)
@@ -566,6 +624,19 @@ class SynthesizerTrnVits2(nn.Module):
         self.use_noise_scaled_mas = self.vits2_use_noise_scaled_mas
 
         self.vits2_infer_sdp_ratio = float(vits2_infer_sdp_ratio)
+
+        self.vits2_use_explicit_pitch = bool(vits2_use_explicit_pitch)
+
+        self.pitch_predictor = None
+        if self.vits2_use_explicit_pitch:
+            self.pitch_predictor = PitchPredictor(
+                in_channels=hidden_channels,
+                hidden_channels=hidden_channels,
+                kernel_size=int(vits2_pitch_predictor_kernel_size),
+                n_layers=int(vits2_pitch_predictor_layers),
+                p_dropout=float(vits2_pitch_predictor_dropout),
+                gin_channels=gin_channels,
+            )
 
         if self.n_speakers > 1:
             self.emb_g = nn.Embedding(self.n_speakers, gin_channels)
@@ -635,8 +706,31 @@ class SynthesizerTrnVits2(nn.Module):
                 hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
             )
 
-    def _decode(self, z, g=None):
-        dec_out = self.dec(z, g=g)
+    @staticmethod
+    def _expand_by_attn(x, attn):
+        # x: [B, C, T_text], attn: [B, 1, T_frame, T_text]
+        return torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1, 2)
+
+    @staticmethod
+    def _normalize_pitch(logf0, uv):
+        if logf0 is not None and logf0.dim() == 2:
+            logf0 = logf0.unsqueeze(1)
+        if uv is not None and uv.dim() == 2:
+            uv = uv.unsqueeze(1)
+        return logf0, uv
+
+    def _build_pitch_cond(self, logf0, uv, ids_slice=None):
+        if (logf0 is None) or (uv is None):
+            return None
+
+        if ids_slice is not None:
+            logf0 = commons.slice_segments(logf0, ids_slice, self.segment_size)
+            uv = commons.slice_segments(uv, ids_slice, self.segment_size)
+
+        return {"logf0": logf0, "uv": uv}
+
+    def _decode(self, z, g=None, pitch_cond=None):
+        dec_out = self.dec(z, g=g, pitch_cond=pitch_cond)
         if isinstance(dec_out, (tuple, list)):
             audio = dec_out[0]
             decoder_aux = dec_out[1] if len(dec_out) > 1 else None
@@ -649,7 +743,7 @@ class SynthesizerTrnVits2(nn.Module):
 
         return audio, decoder_aux
 
-    def forward(self, x, x_lengths, y, y_lengths, sid=None):
+    def forward(self, x, x_lengths, y, y_lengths, sid=None, pitch=None, uv=None):
         from . import monotonic_align
 
         if self.n_speakers > 1:
@@ -676,6 +770,18 @@ class SynthesizerTrnVits2(nn.Module):
 
             attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
             attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
+
+        pitch, uv = self._normalize_pitch(pitch, uv)
+
+        pitch_pred_logf0 = None
+        pitch_pred_uv_logits = None
+        frame_hidden = None
+
+        if self.vits2_use_explicit_pitch and (self.pitch_predictor is not None):
+            frame_hidden = self._expand_by_attn(hidden_x, attn)
+            pitch_pred_logf0, pitch_pred_uv_logits = self.pitch_predictor(
+                frame_hidden, y_mask, g=g
+            )
 
         w = attn.sum(2)  # [b, 1, t_x]
         logw_ = torch.log(w + 1e-6) * x_mask
@@ -706,7 +812,32 @@ class SynthesizerTrnVits2(nn.Module):
         logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
         z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
-        o, decoder_aux = self._decode(z_slice, g=g)
+
+        pitch_cond = None
+        if self.vits2_use_explicit_pitch:
+            if (pitch is not None) and (uv is not None):
+                pitch_cond = self._build_pitch_cond(pitch, uv, ids_slice=ids_slice)
+            elif (pitch_pred_logf0 is not None) and (pitch_pred_uv_logits is not None):
+                pitch_cond = self._build_pitch_cond(
+                    pitch_pred_logf0,
+                    torch.sigmoid(pitch_pred_uv_logits),
+                    ids_slice=ids_slice,
+                )
+
+        o, decoder_aux = self._decode(z_slice, g=g, pitch_cond=pitch_cond)
+
+        extra = {
+            "hidden_x": hidden_x,
+            "logw_dp": logw,
+            "logw_target": logw_,
+            "logw_sdp": logw_sdp,
+            "g": g,
+            "pitch_pred_logf0": pitch_pred_logf0,
+            "pitch_pred_uv_logits": pitch_pred_uv_logits,
+            "pitch_gt_logf0": pitch,
+            "pitch_gt_uv": uv,
+            "pitch_mask": y_mask,
+        }
 
         return (
             o,
@@ -716,7 +847,7 @@ class SynthesizerTrnVits2(nn.Module):
             x_mask,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
-            (hidden_x, logw, logw_, logw_sdp, g),
+            extra,
             decoder_aux,
         )
 
@@ -754,10 +885,26 @@ class SynthesizerTrnVits2(nn.Module):
         attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
         attn = commons.generate_path(w_ceil, attn_mask)
 
+        pitch_cond = None
+        if self.vits2_use_explicit_pitch and (self.pitch_predictor is not None):
+            frame_hidden = self._expand_by_attn(x_enc, attn)
+            pred_logf0, pred_uv_logits = self.pitch_predictor(frame_hidden, y_mask, g=g)
+            pred_uv = torch.sigmoid(pred_uv_logits)
+
+            if max_len is not None:
+                pred_logf0 = pred_logf0[:, :, :max_len]
+                pred_uv = pred_uv[:, :, :max_len]
+
+            pitch_cond = {
+                "logf0": pred_logf0,
+                "uv": pred_uv,
+            }
+
         m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
         logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=g, reverse=True)
-        o, _ = self._decode((z * y_mask)[:, :, :max_len], g=g)
+        z_dec = (z * y_mask)[:, :, :max_len]
+        o, _ = self._decode(z_dec, g=g, pitch_cond=pitch_cond)
         return o, attn, y_mask, (z, z_p, m_p, logs_p)
