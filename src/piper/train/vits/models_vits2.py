@@ -678,6 +678,11 @@ class SynthesizerTrnVits2(nn.Module):
             gen_istft_hop_size=self.gen_istft_hop_size,
             subbands=self.subbands,
             is_onnx=is_onnx,
+            sample_rate=self.sample_rate,
+            use_explicit_pitch=self.vits2_use_explicit_pitch,
+            periodicity_use_uv=vits2_periodicity_use_uv,
+            periodicity_use_noise=vits2_periodicity_use_noise,
+            periodicity_noise_std=vits2_periodicity_noise_std,
         )
         self.enc_q = PosteriorEncoder(
             spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels
