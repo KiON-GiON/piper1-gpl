@@ -19,6 +19,11 @@ class DurationDiscriminatorV2(nn.Module):
         self.pre_out_conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size // 2)
         self.pre_out_norm_2 = modules.LayerNorm(filter_channels)
 
+        if gin_channels > 0:
+            self.cond = nn.Conv1d(gin_channels, in_channels, 1)
+        else:
+            self.cond = None
+
         self.output_layer = nn.Sequential(nn.Linear(filter_channels, 1), nn.Sigmoid())
 
     def forward_probability(self, x, x_mask, dur):
@@ -38,6 +43,11 @@ class DurationDiscriminatorV2(nn.Module):
 
     def forward(self, x, x_mask, dur_real, dur_fake, g=None):
         x = torch.detach(x)
+
+        if (g is not None) and (self.cond is not None):
+            g = torch.detach(g)
+            x = x + self.cond(g)
+
         x = self.conv_1(x * x_mask)
         x = torch.relu(x)
         x = self.norm_1(x)
