@@ -559,6 +559,7 @@ class VitsModel(L.LightningModule):
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         self._mas_batch_step = int(checkpoint.get("mas_batch_step", 0))
+        self.load_state_dict(checkpoint["state_dict"], strict=False)
 
     def _load_generator_weights(self, ckpt_path: str):
 
