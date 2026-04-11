@@ -326,7 +326,6 @@ class VitsModel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.strict_load = False
 
         if isinstance(self.hparams.resblock_kernel_sizes, str):
             self.hparams.resblock_kernel_sizes = ast.literal_eval(
@@ -541,6 +540,8 @@ class VitsModel(L.LightningModule):
                 target_sr=self.hparams.ssl_sample_rate,
                 layers=tuple(self.hparams.ssl_feature_layers),
             )
+
+        self.strict_loading = False
 
         if init_from_checkpoint:
             self._load_generator_weights(init_from_checkpoint)
