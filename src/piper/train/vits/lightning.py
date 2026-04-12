@@ -273,6 +273,7 @@ class VitsModel(L.LightningModule):
         use_mel_posterior_encoder: bool = False,
         use_duration_discriminator: bool = False,
         duration_discriminator_type: str = "dur_disc_2",
+        c_dur_disc: float = 1.0,
         # Pitch
         use_explicit_pitch: bool = False,
         pitch_loss_f0_weight: float = 1.0,
@@ -1119,7 +1120,8 @@ class VitsModel(L.LightningModule):
             self.log("loss_ssl", loss_ssl, batch_size=batch_size)
 
         if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
-            loss_g = loss_g + self._loss_g_dur(pack.extra, pack.x_mask)
+            loss_dur_g = self._loss_g_dur(pack.extra, pack.x_mask)
+            loss_g = loss_g + loss_dur_g * self.hparams.c_dur_disc
 
         self.manual_backward(loss_g)
         opt_g.step()
@@ -1167,7 +1169,7 @@ class VitsModel(L.LightningModule):
                 self.log("val_loss_ssl", loss_ssl, batch_size=batch_size)
 
             if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
-                val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask)
+                val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask) * self.hparams.c_dur_disc
 
         self.log("val_loss", val_loss, batch_size=batch_size)
         return val_loss
