@@ -173,6 +173,7 @@ def rational_quadratic_spline(
             discriminant = b.pow(2) - 4 * a * c
             discriminant = torch.clamp(discriminant, min=0.0)
             root = torch.sqrt(discriminant + 1e-9)
+
         outputs = root * input_bin_widths + input_cumwidths
 
         theta_one_minus_theta = root * (1 - root)
