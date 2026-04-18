@@ -1,5 +1,6 @@
 """PyTorch Lightning dataset."""
 
+import os
 import csv
 import itertools
 import json
@@ -8,6 +9,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import librosa
 import lightning as L
@@ -16,6 +18,11 @@ import torch
 from pysilero_vad import SileroVoiceActivityDetector
 from torch import FloatTensor, LongTensor
 from torch.utils.data import DataLoader, Dataset, random_split
+
+try:
+    import pyworld as pw
+except Exception:
+    pw = None
 
 from piper.config import PhonemeType, PiperConfig
 from piper.phoneme_ids import DEFAULT_PHONEME_ID_MAP, phonemes_to_ids
@@ -26,6 +33,227 @@ from .utils import get_cache_id
 
 _LOGGER = logging.getLogger(__name__)
 VAD_SAMPLE_RATE = 16000
+
+_WORKER_VAD = None
+
+def _init_prepare_worker():
+    """Initializer for each ProcessPool worker."""
+    global _WORKER_VAD
+    from pysilero_vad import SileroVoiceActivityDetector
+    _WORKER_VAD = SileroVoiceActivityDetector()
+
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+
+def _trim_silence_worker(
+    audio_original_array: np.ndarray,
+    audio_16khz_array: np.ndarray,
+    threshold: float,
+    keep_seconds_before_silence: float,
+    keep_seconds_after_silence: float,
+) -> np.ndarray:
+    """Equivalent trimming logic, but for worker processes."""
+    global _WORKER_VAD
+    vad = _WORKER_VAD
+    if vad is None:
+        return audio_original_array
+
+    vad.reset()
+
+    first_chunk = None
+    last_chunk = None
+
+    samples_per_chunk = vad.chunk_samples()
+    seconds_per_chunk = samples_per_chunk / VAD_SAMPLE_RATE
+    num_chunks = len(audio_16khz_array) // samples_per_chunk
+
+    for chunk_idx in range(num_chunks):
+        off = chunk_idx * samples_per_chunk
+        chunk = audio_16khz_array[off : off + samples_per_chunk]
+        if len(chunk) < samples_per_chunk:
+            continue
+
+        prob = vad.process_array(chunk)
+        is_speech = prob >= threshold
+
+        if is_speech:
+            if first_chunk is None:
+                first_chunk = chunk_idx
+            last_chunk = chunk_idx
+
+    if (first_chunk is None) or (last_chunk is None):
+        return audio_original_array
+
+    num_original_samples = len(audio_original_array)
+    audio_seconds = len(audio_16khz_array) / VAD_SAMPLE_RATE
+
+    first_sec = first_chunk * seconds_per_chunk
+    first_sec = max(0.0, first_sec - keep_seconds_before_silence)
+    first_sample = int(math.floor(num_original_samples * (first_sec / audio_seconds)))
+
+    last_sec = (last_chunk + 1) * seconds_per_chunk
+    last_sec = min(audio_seconds, last_sec + keep_seconds_after_silence)
+    last_sample = int(math.ceil(num_original_samples * (last_sec / audio_seconds)))
+
+    return audio_original_array[first_sample:last_sample]
+
+
+def _fit_feature_length_np(values: np.ndarray, target_length: int, pad_value: float = 0.0) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if values.shape[0] == target_length:
+        return values
+    if values.shape[0] > target_length:
+        return values[:target_length]
+    if values.shape[0] == 0:
+        return np.full((target_length,), pad_value, dtype=np.float32)
+    pad = np.full((target_length - values.shape[0],), pad_value, dtype=np.float32)
+    return np.concatenate([values, pad], axis=0)
+
+
+def _extract_log_f0_and_voiced_pyworld(
+    audio_array: np.ndarray,
+    sample_rate: int,
+    hop_length: int,
+    pitch_fmin: float,
+    pitch_fmax: float,
+    target_frames: int,
+):
+    import pyworld as pw
+
+    x = np.asarray(audio_array, dtype=np.float64)
+    frame_period_ms = (hop_length / sample_rate) * 1000.0
+
+    f0, t = pw.dio(
+        x,
+        fs=int(sample_rate),
+        f0_floor=float(pitch_fmin),
+        f0_ceil=float(pitch_fmax),
+        frame_period=frame_period_ms,
+    )
+    f0 = pw.stonemask(x, f0, t, fs=int(sample_rate))
+    f0 = np.asarray(f0, dtype=np.float32)
+
+    voiced = (f0 > 0.0).astype(np.float32)
+
+    if np.any(voiced > 0.5):
+        idx = np.where(voiced > 0.5)[0]
+        cf0 = np.interp(np.arange(len(f0)), idx, f0[idx]).astype(np.float32)
+    else:
+        cf0 = np.zeros_like(f0, dtype=np.float32)
+
+    log_f0 = np.log(np.clip(cf0, a_min=1.0, a_max=None)).astype(np.float32)
+
+    log_pad_value = float(log_f0[-1]) if log_f0.size > 0 else 0.0
+    log_f0 = _fit_feature_length_np(log_f0, target_frames, pad_value=log_pad_value)
+    voiced = _fit_feature_length_np(voiced, target_frames, pad_value=0.0)
+
+    return torch.from_numpy(log_f0), torch.from_numpy(voiced)
+
+
+def _process_audio_spec_pitch_task(task: dict) -> tuple[bool, str]:
+    """
+    Worker task:
+      - load + (optional) trim + save normalized audio
+      - compute + save spectrogram
+      - compute + save log_f0/voiced (optional)
+    """
+    try:
+        import librosa
+        import torch
+        from .mel_processing import spectrogram_torch  # local import (worker safe)
+
+        audio_path = task["audio_path"]
+        norm_audio_path = task["norm_audio_path"]
+        spec_path = task["spec_path"]
+        do_pitch = task["do_pitch"]
+        logf0_path = task.get("logf0_path")
+        voiced_path = task.get("voiced_path")
+
+        sample_rate = int(task["sample_rate"])
+        filter_length = int(task["filter_length"])
+        hop_length = int(task["hop_length"])
+        win_length = int(task["win_length"])
+
+        trim_silence = bool(task["trim_silence"])
+        keep_before = float(task["keep_before"])
+        keep_after = float(task["keep_after"])
+        vad_threshold = float(task.get("vad_threshold", 0.2))
+
+        pitch_fmin = float(task.get("pitch_fmin", 40.0))
+        pitch_fmax = float(task.get("pitch_fmax", 1100.0))
+
+        if os.path.exists(norm_audio_path) and os.path.exists(spec_path):
+            if not do_pitch:
+                return True, audio_path
+            if os.path.exists(logf0_path) and os.path.exists(voiced_path):
+                return True, audio_path
+
+        audio, _sr = librosa.load(audio_path, sr=sample_rate, mono=True)
+        audio = np.asarray(audio, dtype=np.float32)
+
+        if trim_silence:
+            if sample_rate != VAD_SAMPLE_RATE:
+                audio_16k = librosa.resample(audio, orig_sr=sample_rate, target_sr=VAD_SAMPLE_RATE)
+            else:
+                audio_16k = audio
+
+            audio = _trim_silence_worker(
+                audio_original_array=audio,
+                audio_16khz_array=np.asarray(audio_16k, dtype=np.float32),
+                threshold=vad_threshold,
+                keep_seconds_before_silence=keep_before,
+                keep_seconds_after_silence=keep_after,
+            )
+            audio = np.asarray(audio, dtype=np.float32)
+
+        if not os.path.exists(norm_audio_path):
+            torch.save(torch.FloatTensor(audio), norm_audio_path)
+
+        if not os.path.exists(spec_path):
+            with torch.no_grad():
+                audio_t = torch.FloatTensor(audio).unsqueeze(0)
+                spec = spectrogram_torch(
+                    y=audio_t,
+                    n_fft=filter_length,
+                    sampling_rate=sample_rate,
+                    hop_size=hop_length,
+                    win_size=win_length,
+                    center=False,
+                ).squeeze(0)
+            torch.save(spec, spec_path)
+            target_frames = int(spec.size(1))
+        else:
+            target_frames = None
+
+        if do_pitch:
+            assert logf0_path is not None and voiced_path is not None
+
+            need_logf0 = not os.path.exists(logf0_path)
+            need_voiced = not os.path.exists(voiced_path)
+            if need_logf0 or need_voiced:
+                if target_frames is None:
+                    spec = torch.load(spec_path, map_location="cpu")
+                    target_frames = int(spec.size(1))
+
+                log_f0, voiced = _extract_log_f0_and_voiced_pyworld(
+                    audio_array=audio,
+                    sample_rate=sample_rate,
+                    hop_length=hop_length,
+                    pitch_fmin=pitch_fmin,
+                    pitch_fmax=pitch_fmax,
+                    target_frames=target_frames,
+                )
+                if need_logf0:
+                    torch.save(log_f0.contiguous(), logf0_path)
+                if need_voiced:
+                    torch.save(voiced.contiguous(), voiced_path)
+
+        return True, audio_path
+
+    except Exception as e:
+        return False, f"{task.get('audio_path','?')}: {repr(e)}"
 
 
 @dataclass
@@ -63,6 +291,7 @@ class VitsDataModule(L.LightningDataModule):
         trim_silence: bool = True,
         keep_seconds_before_silence: float = 0.25,
         keep_seconds_after_silence: float = 0.25,
+        prepare_num_workers: int = 0,
         compute_pitch_features: bool = False,
         pitch_fmin: float = 40.0,
         pitch_fmax: float = 1100.0,
@@ -108,6 +337,7 @@ class VitsDataModule(L.LightningDataModule):
 
         self.piper_config: Optional[PiperConfig] = None
         self.is_multispeaker = self.num_speakers > 1
+        self.prepare_num_workers = int(prepare_num_workers)
 
         self.compute_pitch_features = compute_pitch_features
         self.pitch_fmin = float(pitch_fmin)
@@ -138,41 +368,39 @@ class VitsDataModule(L.LightningDataModule):
         audio_array: np.ndarray,
         target_frames: int,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        audio_array = np.asarray(audio_array, dtype=np.float64)
+        if pw is None:
+            raise RuntimeError(
+                "pyworld is not installed. Run: pip install pyworld"
+            )
 
-        f0, voiced_flag, _voiced_prob = librosa.pyin(
-            audio_array,
-            fmin=self.pitch_fmin,
-            fmax=self.pitch_fmax,
-            sr=self.sample_rate,
-            frame_length=self.filter_length,
-            hop_length=self.hop_length,
-            center=False,
-            fill_na=np.nan,
+        x = np.asarray(audio_array, dtype=np.float64)
+
+        frame_period_ms = (self.hop_length / self.sample_rate) * 1000.0
+
+        f0, t = pw.dio(
+            x,
+            fs=int(self.sample_rate),
+            f0_floor=float(self.pitch_fmin),
+            f0_ceil=float(self.pitch_fmax),
+            frame_period=frame_period_ms,
         )
-
-        if f0 is None:
-            f0 = np.zeros((0,), dtype=np.float32)
-            voiced_flag = np.zeros((0,), dtype=np.float32)
+        f0 = pw.stonemask(x, f0, t, fs=int(self.sample_rate))
 
         f0 = np.asarray(f0, dtype=np.float32)
-        voiced = np.asarray(voiced_flag, dtype=np.float32)
 
-        voiced = np.nan_to_num(voiced, nan=0.0, posinf=0.0, neginf=0.0)
-        finite_mask = np.isfinite(f0).astype(np.float32)
-        voiced = np.maximum(voiced, finite_mask)
+        # voiced/unvoiced
+        voiced = (f0 > 0.0).astype(np.float32)
 
-        f0 = np.nan_to_num(f0, nan=0.0, posinf=0.0, neginf=0.0)
-
+        # continuous f0
         if np.any(voiced > 0.5):
-            voiced_idx = np.where(voiced > 0.5)[0]
-            cont_f0 = np.interp(np.arange(len(f0)), voiced_idx, f0[voiced_idx]).astype(np.float32)
+            idx = np.where(voiced > 0.5)[0]
+            cf0 = np.interp(np.arange(len(f0)), idx, f0[idx]).astype(np.float32)
         else:
-            cont_f0 = np.zeros_like(f0, dtype=np.float32)
+            cf0 = np.zeros_like(f0, dtype=np.float32)
 
-        log_f0 = np.log(np.clip(cont_f0, a_min=1.0, a_max=None)).astype(np.float32)
+        log_f0 = np.log(np.clip(cf0, a_min=1.0, a_max=None)).astype(np.float32)
 
-        log_pad_value = float(log_f0[-1]) if len(log_f0) > 0 else 0.0
+        log_pad_value = float(log_f0[-1]) if log_f0.size > 0 else 0.0
         log_f0 = self._fit_feature_length(log_f0, target_frames, pad_value=log_pad_value)
         voiced = self._fit_feature_length(voiced, target_frames, pad_value=0.0)
 
@@ -193,56 +421,39 @@ class VitsDataModule(L.LightningDataModule):
 
         speaker_id_map: Dict[str, int] = {}
         if self.is_multispeaker:
-            # Generate speaker id map
             with open(self.csv_path, "r", encoding="utf-8") as csv_file:
                 reader = csv.reader(csv_file, delimiter="|")
                 for row in reader:
-                    assert (
-                        len(row) >= 3
-                    ), "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
+                    assert len(row) >= 3, "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
                     speaker_name = row[1]
-                    if speaker_name in speaker_id_map:
-                        continue
+                    if speaker_name not in speaker_id_map:
+                        speaker_id_map[speaker_name] = len(speaker_id_map)
 
-                    speaker_id_map[speaker_name] = len(speaker_id_map)
-
-            assert (
-                len(speaker_id_map) <= self.num_speakers
-            ), "More speakers in metadata than num_speakers"
-
+            assert len(speaker_id_map) <= self.num_speakers, "More speakers in metadata than num_speakers"
             if len(speaker_id_map) != self.num_speakers:
-                _LOGGER.warning(
-                    "Expected %s speakers in the dataset, got %s",
-                    self.num_speakers,
-                    len(speaker_id_map),
-                )
+                _LOGGER.warning("Expected %s speakers in the dataset, got %s", self.num_speakers, len(speaker_id_map))
 
             self.piper_config.speaker_id_map = speaker_id_map
 
         # Write config
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.config_path, "w", encoding="utf-8") as config_file:
-            json.dump(
-                self.piper_config.to_dict(),
-                config_file,
-                ensure_ascii=False,
-                indent=2,
-            )
+            json.dump(self.piper_config.to_dict(), config_file, ensure_ascii=False, indent=2)
 
         phonemizer = EspeakPhonemizer()
-        vad = SileroVoiceActivityDetector()
 
+        tasks: list[dict] = []
         num_utterances = 0
         report_prepare: Optional[bool] = None
+
         with open(self.csv_path, "r", encoding="utf-8") as csv_file:
             reader = csv.reader(csv_file, delimiter="|")
             for row_number, row in enumerate(reader, start=1):
                 utt_id, text = row[0], row[-1]
+
                 speaker_id: Optional[int] = None
                 if self.is_multispeaker:
-                    assert (
-                        len(row) >= 3
-                    ), "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
+                    assert len(row) >= 3, "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
                     speaker_name = row[1]
                     speaker_id = speaker_id_map[speaker_name]
 
@@ -266,10 +477,9 @@ class VitsDataModule(L.LightningDataModule):
                 phonemes_path = self.cache_dir / f"{cache_id}.phonemes.txt"
                 if not phonemes_path.exists():
                     phonemes = phonemizer.phonemize(self.espeak_voice, text)
-                    with open(phonemes_path, "w", encoding="utf-8") as phonemes_file:
+                    with open(phonemes_path, "w", encoding="utf-8") as f:
                         for sentence_phonemes in phonemes:
-                            print("".join(sentence_phonemes), file=phonemes_file)
-
+                            print("".join(sentence_phonemes), file=f)
                     if report_prepare is None:
                         report_prepare = True
 
@@ -291,84 +501,64 @@ class VitsDataModule(L.LightningDataModule):
                     if report_prepare is None:
                         report_prepare = True
 
-                # normalized audio
                 norm_audio_path = self.cache_dir / f"{cache_id}.audio.pt"
-                audio_norm_tensor: Optional[torch.Tensor] = None
-                if not norm_audio_path.exists():
-                    audio_norm_array, audio_sample_rate = librosa.load(
-                        path=audio_path, sr=self.sample_rate, mono=True
-                    )
-                    if self.trim_silence:
-                        if audio_sample_rate != VAD_SAMPLE_RATE:
-                            # VAD needs 16Khz
-                            audio_16khz_array, _sr = librosa.load(
-                                path=audio_path, sr=VAD_SAMPLE_RATE, mono=True
-                            )
-                        else:
-                            audio_16khz_array = audio_norm_array
-
-                        audio_norm_array = self._trim_silence(
-                            audio_norm_array, audio_16khz_array, vad
-                        )
-
-                    audio_norm_tensor = torch.FloatTensor(audio_norm_array)
-                    torch.save(
-                        audio_norm_tensor,
-                        norm_audio_path,
-                    )
-                    if report_prepare is None:
-                        report_prepare = True
-
-                # mel spectrogram
                 audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
-                spec_tensor: Optional[torch.Tensor] = None
-                if not audio_spec_path.exists():
-                    if audio_norm_tensor is None:
-                        # Load audio from cache
-                        audio_norm_tensor = torch.load(norm_audio_path)
 
-                    spec_tensor = spectrogram_torch(
-                        y=audio_norm_tensor.unsqueeze(0),
-                        n_fft=self.filter_length,
-                        sampling_rate=self.sample_rate,
-                        hop_size=self.hop_length,
-                        win_size=self.win_length,
-                        center=False,
-                    ).squeeze(0)
-
-                    torch.save(spec_tensor, audio_spec_path)
-                    if report_prepare is None:
-                        report_prepare = True
-
-                # pitch features
                 pitch_log_f0_path = self.cache_dir / f"{cache_id}.log_f0.pt"
                 pitch_voiced_path = self.cache_dir / f"{cache_id}.voiced.pt"
 
-                if self.compute_pitch_features and (
-                    (not pitch_log_f0_path.exists()) or (not pitch_voiced_path.exists())
-                ):
-                    if audio_norm_tensor is None:
-                        audio_norm_tensor = torch.load(norm_audio_path)
+                do_pitch = bool(self.compute_pitch_features)
+                # Skip task if everything already exists
+                if norm_audio_path.exists() and audio_spec_path.exists():
+                    if (not do_pitch) or (pitch_log_f0_path.exists() and pitch_voiced_path.exists()):
+                        num_utterances += 1
+                        continue
 
-                    if spec_tensor is None:
-                        spec_tensor = torch.load(audio_spec_path)
-
-                    target_frames = int(spec_tensor.size(1))
-                    log_f0_tensor, voiced_tensor = self._extract_log_f0_and_voiced(
-                        audio_norm_tensor.cpu().numpy(),
-                        target_frames=target_frames,
+                tasks.append(
+                    dict(
+                        audio_path=str(audio_path),
+                        norm_audio_path=str(norm_audio_path),
+                        spec_path=str(audio_spec_path),
+                        do_pitch=do_pitch,
+                        logf0_path=str(pitch_log_f0_path) if do_pitch else None,
+                        voiced_path=str(pitch_voiced_path) if do_pitch else None,
+                        sample_rate=int(self.sample_rate),
+                        filter_length=int(self.filter_length),
+                        hop_length=int(self.hop_length),
+                        win_length=int(self.win_length),
+                        trim_silence=bool(self.trim_silence),
+                        keep_before=float(self.keep_seconds_before_silence),
+                        keep_after=float(self.keep_seconds_after_silence),
+                        vad_threshold=0.2,
+                        pitch_fmin=float(self.pitch_fmin),
+                        pitch_fmax=float(self.pitch_fmax),
                     )
-
-                    torch.save(log_f0_tensor, pitch_log_f0_path)
-                    torch.save(voiced_tensor, pitch_voiced_path)
-
-                    if report_prepare is None:
-                        report_prepare = True
+                )
 
                 num_utterances += 1
                 if report_prepare:
-                    _LOGGER.info("Processing utterances...")
+                    _LOGGER.info("Preparing utterances (serial text/phonemes, parallel audio/spec/pitch)...")
                     report_prepare = False
+
+        if tasks:
+            max_workers = self.prepare_num_workers if self.prepare_num_workers > 0 else (os.cpu_count() or 1)
+            max_workers = max(1, int(max_workers))
+            _LOGGER.info("prepare_data: processing %s utterance(s) with %s worker(s)", len(tasks), max_workers)
+
+            ok_count = 0
+            fail_count = 0
+
+            with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_prepare_worker) as ex:
+                futures = [ex.submit(_process_audio_spec_pitch_task, t) for t in tasks]
+                for fut in as_completed(futures):
+                    ok, msg = fut.result()
+                    if ok:
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+                        _LOGGER.warning("prepare_data worker failed: %s", msg)
+
+            _LOGGER.info("prepare_data: parallel stage done (ok=%s, failed=%s)", ok_count, fail_count)
 
         _LOGGER.info("Processed %s utterance(s)", num_utterances)
 
