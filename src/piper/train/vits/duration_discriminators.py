@@ -24,7 +24,7 @@ class DurationDiscriminatorV2(nn.Module):
         else:
             self.cond = None
 
-        self.output_layer = nn.Sequential(nn.Linear(filter_channels, 1), nn.Sigmoid())
+        self.output_layer = nn.Sequential(nn.Linear(filter_channels, 1))
 
     def forward_probability(self, x, x_mask, dur):
         dur = self.dur_proj(dur)
@@ -104,10 +104,7 @@ class DurationDiscriminatorLSTM(nn.Module):
         else:
             self.cond = None
 
-        self.output_layer = nn.Sequential(
-            nn.Linear(2 * filter_channels, 1),
-            nn.Sigmoid(),
-        )
+        self.output_layer = nn.Linear(2 * filter_channels, 1)
 
     def _encode_x(self, x, x_mask, g=None):
         x = torch.detach(x)

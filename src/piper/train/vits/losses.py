@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 
 def feature_loss(fmap_r, fmap_g):
@@ -126,6 +127,45 @@ def masked_generator_loss(disc_outputs, x_mask: torch.Tensor):
         loss = loss + l
 
     return loss, gen_losses
+
+def masked_hinge_discriminator_loss(disc_real_outputs, disc_generated_outputs, x_mask: torch.Tensor):
+    loss = 0.0
+    r_losses = []
+    g_losses = []
+
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        dr = dr.float()
+        dg = dg.float()
+
+        m = _mask_like_disc_output(dr, x_mask).to(device=dr.device, dtype=dr.dtype)
+        denom = torch.clamp_min(m.sum(), 1.0)
+
+        r_loss = (F.relu(1.0 - dr) * m).sum() / denom
+        g_loss = (F.relu(1.0 + dg) * m).sum() / denom
+
+        loss = loss + r_loss + g_loss
+        r_losses.append(r_loss.item())
+        g_losses.append(g_loss.item())
+
+    return loss, r_losses, g_losses
+
+
+def masked_hinge_generator_loss(disc_outputs, x_mask: torch.Tensor):
+    loss = 0.0
+    gen_losses = []
+
+    for dg in disc_outputs:
+        dg = dg.float()
+
+        m = _mask_like_disc_output(dg, x_mask).to(device=dg.device, dtype=dg.dtype)
+        denom = torch.clamp_min(m.sum(), 1.0)
+
+        l = (-(dg) * m).sum() / denom
+        loss = loss + l
+        gen_losses.append(l.item())
+
+    return loss, gen_losses
+
 
 def subband_stft_loss_from_module(stft_loss_module, y_mb, y_hat_mb):
     y_mb = y_mb.contiguous().view(-1, y_mb.size(-1))
