@@ -177,7 +177,7 @@ class ISTFTGenerator(_ISTFTDecoderBase):
         self.conv_post.apply(init_weights)
 
     def forward(self, x, g=None, pitch_cond=None):
-        x = self._forward_backbone(x, g=g)
+        x = self._forward_backbone(x, g=g, pitch_cond=pitch_cond)
         x = self.reflection_pad(x)
         x = self.conv_post(x)
 
@@ -215,7 +215,7 @@ class MultibandISTFTGenerator(_ISTFTDecoderBase):
         self.pqmf = PQMF(subbands=self.subbands)
 
     def forward(self, x, g=None, pitch_cond=None):
-        x = self._forward_backbone(x, g=g)
+        x = self._forward_backbone(x, g=g, pitch_cond=pitch_cond)
         x = self.reflection_pad(x)
         x = self.subband_conv_post(x)
 
@@ -272,7 +272,7 @@ class MultistreamISTFTGenerator(_ISTFTDecoderBase):
         self.multistream_conv_post.apply(init_weights)
 
     def forward(self, x, g=None, pitch_cond=None):
-        x = self._forward_backbone(x, g=g)
+        x = self._forward_backbone(x, g=g, pitch_cond=pitch_cond)
         x = self.reflection_pad(x)
         x = self.subband_conv_post(x)
 
