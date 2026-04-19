@@ -24,7 +24,7 @@ class DurationDiscriminatorV2(nn.Module):
         else:
             self.cond = None
 
-        self.output_layer = nn.Sequential(nn.Linear(filter_channels, 1))
+        self.output_layer = nn.Linear(filter_channels, 1)
 
     def forward_probability(self, x, x_mask, dur):
         dur = self.dur_proj(dur)
