@@ -1121,6 +1121,14 @@ class VitsModel(L.LightningModule):
 
         if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
             loss_dur_g = self._loss_g_dur(pack.extra, pack.x_mask)
+
+            self.log("loss_g_dur", loss_dur_g.detach(), batch_size=batch_size)
+            self.log(
+                "loss_g_dur_w",
+                (loss_dur_g.detach() * float(self.hparams.c_dur_disc)),
+                batch_size=batch_size,
+            )
+
             loss_g = loss_g + loss_dur_g * self.hparams.c_dur_disc
 
         self.manual_backward(loss_g)
@@ -1169,7 +1177,14 @@ class VitsModel(L.LightningModule):
                 self.log("val_loss_ssl", loss_ssl, batch_size=batch_size)
 
             if (getattr(self, "model_dur", None) is not None) and (pack.extra is not None):
-                val_loss = val_loss + self._loss_g_dur(pack.extra, pack.x_mask) * self.hparams.c_dur_disc
+                loss_dur_g = self._loss_g_dur(pack.extra, pack.x_mask)
+                self.log("val_loss_g_dur", loss_dur_g.detach(), batch_size=batch_size)
+                self.log(
+                    "val_loss_g_dur_w",
+                    (loss_dur_g.detach() * float(self.hparams.c_dur_disc)),
+                    batch_size=batch_size,
+                )
+                val_loss = val_loss + loss_dur_g * self.hparams.c_dur_disc
 
         self.log("val_loss", val_loss, batch_size=batch_size)
         return val_loss
