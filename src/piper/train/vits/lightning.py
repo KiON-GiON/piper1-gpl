@@ -22,8 +22,8 @@ from .losses import (
     feature_loss,
     generator_loss,
     kl_loss,
-    masked_hinge_discriminator_loss,
-    masked_hinge_generator_loss,
+    masked_bce_discriminator_loss,
+    masked_bce_generator_loss,
 )
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from .models import MultiPeriodDiscriminator, SynthesizerTrn
@@ -891,7 +891,7 @@ class VitsModel(L.LightningModule):
             g_det,
         )
         with autocast(self.device.type, enabled=False):
-            loss_dp, _, _ = masked_hinge_discriminator_loss(y_dur_r, y_dur_g, x_mask_det)
+            loss_dp, _, _ = masked_bce_discriminator_loss(y_dur_r, y_dur_g, x_mask_det)
         losses.append(loss_dp)
 
         if logw_sdp is not None:
@@ -903,7 +903,7 @@ class VitsModel(L.LightningModule):
                 g_det,
             )
             with autocast(self.device.type, enabled=False):
-                loss_sdp, _, _ = masked_hinge_discriminator_loss(
+                loss_sdp, _, _ = masked_bce_discriminator_loss(
                     y_dur_r_sdp, y_dur_g_sdp, x_mask_det
                 )
             losses.append(loss_sdp)
@@ -927,7 +927,7 @@ class VitsModel(L.LightningModule):
             g,
         )
         with autocast(self.device.type, enabled=False):
-            loss_dp, _ = masked_hinge_generator_loss(y_dur_g_dp, x_mask)
+            loss_dp, _ = masked_bce_generator_loss(y_dur_g_dp, x_mask)
         losses.append(loss_dp)
 
         if logw_sdp is not None:
@@ -939,7 +939,7 @@ class VitsModel(L.LightningModule):
                 g,
             )
             with autocast(self.device.type, enabled=False):
-                loss_sdp, _ = masked_hinge_generator_loss(y_dur_g_sdp, x_mask)
+                loss_sdp, _ = masked_bce_generator_loss(y_dur_g_sdp, x_mask)
             losses.append(loss_sdp)
 
         return sum(losses) / len(losses)

@@ -128,43 +128,30 @@ def masked_generator_loss(disc_outputs, x_mask: torch.Tensor):
 
     return loss, gen_losses
 
-def masked_hinge_discriminator_loss(disc_real_outputs, disc_generated_outputs, x_mask: torch.Tensor):
-    loss = 0.0
-    r_losses = []
-    g_losses = []
 
+def masked_bce_discriminator_loss(disc_real_outputs, disc_generated_outputs, x_mask):
+    loss = 0.0
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        dr = dr.float()
-        dg = dg.float()
-
+        dr = dr.float(); dg = dg.float()
         m = _mask_like_disc_output(dr, x_mask).to(device=dr.device, dtype=dr.dtype)
-        denom = torch.clamp_min(m.sum(), 1.0)
+        denom = m.sum().clamp_min(1.0)
 
-        r_loss = (F.relu(1.0 - dr) * m).sum() / denom
-        g_loss = (F.relu(1.0 + dg) * m).sum() / denom
-
-        loss = loss + r_loss + g_loss
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
-
-    return loss, r_losses, g_losses
+        l_r = (F.binary_cross_entropy_with_logits(dr, torch.ones_like(dr), reduction="none") * m).sum() / denom
+        l_g = (F.binary_cross_entropy_with_logits(dg, torch.zeros_like(dg), reduction="none") * m).sum() / denom
+        loss = loss + l_r + l_g
+    return loss
 
 
-def masked_hinge_generator_loss(disc_outputs, x_mask: torch.Tensor):
+def masked_bce_generator_loss(disc_outputs, x_mask):
     loss = 0.0
-    gen_losses = []
-
     for dg in disc_outputs:
         dg = dg.float()
-
         m = _mask_like_disc_output(dg, x_mask).to(device=dg.device, dtype=dg.dtype)
-        denom = torch.clamp_min(m.sum(), 1.0)
+        denom = m.sum().clamp_min(1.0)
 
-        l = (-(dg) * m).sum() / denom
+        l = (F.binary_cross_entropy_with_logits(dg, torch.ones_like(dg), reduction="none") * m).sum() / denom
         loss = loss + l
-        gen_losses.append(l.item())
-
-    return loss, gen_losses
+    return loss
 
 
 def subband_stft_loss_from_module(stft_loss_module, y_mb, y_hat_mb):
