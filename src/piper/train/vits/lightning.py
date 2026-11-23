@@ -303,6 +303,7 @@ class VitsModel(L.LightningModule):
             _x_mask,
             z_mask,
             (_z, z_p, m_p, logs_p, _m_q, logs_q),
+            dur_info,
         ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
 
         # Mel/STFT must run in fp32: cuFFT does not support bf16, and a stable
