@@ -17,6 +17,7 @@ from .dataset import Batch
 from .losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from .models import (
+    DurationDiscriminator,
     MultiPeriodDiscriminator,
     MultiResolutionDiscriminator,
     SynthesizerTrn,
@@ -103,6 +104,12 @@ class VitsModel(L.LightningModule):
         use_spectral_norm: bool = False,
         gin_channels: int = 0,
         use_sdp: bool = True,
+        use_det_dp: bool = False,
+        use_dur_disc: bool = False,
+        sdp_ratio: Optional[float] = None,
+        use_noise_scaled_mas: bool = False,
+        mas_noise_scale_initial: float = 0.01,
+        noise_scale_delta: float = 2e-6,
         segment_size: int = 8192,
         # Multi-Resolution STFT Discriminator (UnivNet/Vocos-style). Training-
         # only: sharpens spectral detail the period discriminators miss, at
@@ -208,6 +215,8 @@ class VitsModel(L.LightningModule):
         # logged once rather than every epoch. See _log_audio_text.
         self._logged_audio_text: dict[str, str] = {}
 
+        enable_det_dp = bool(use_det_dp or use_dur_disc)
+
         # Set up models
         self.model_g = SynthesizerTrn(
             n_vocab=num_symbols,
@@ -229,7 +238,21 @@ class VitsModel(L.LightningModule):
             n_speakers=self.hparams.num_speakers,
             gin_channels=self.hparams.gin_channels,
             use_sdp=self.hparams.use_sdp,
+            use_det_dp=enable_det_dp,
+            sdp_ratio=self.hparams.sdp_ratio,
+            use_noise_scaled_mas=self.hparams.use_noise_scaled_mas,
+            mas_noise_scale_initial=self.hparams.mas_noise_scale_initial,
+            noise_scale_delta=self.hparams.noise_scale_delta,
         )
+        self.model_dur_disc: Optional[DurationDiscriminator] = None
+        if self.hparams.use_dur_disc:
+            self.model_dur_disc = DurationDiscriminator(
+                self.hparams.hidden_channels,
+                self.hparams.hidden_channels,
+                3,
+                0.1,
+                gin_channels=self.hparams.gin_channels,
+            )
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
@@ -339,6 +362,19 @@ class VitsModel(L.LightningModule):
             loss_gen, _losses_gen = generator_loss(y_d_hat_g)
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
+            loss_dur_gen = y.new_zeros(())
+            if (self.model_dur_disc is not None) and (dur_info is not None):
+                x_dur, x_mask_dur, g_dur, logw_real, logw_det = dur_info
+                _, y_dur_g = self.model_dur_disc(
+                    x_dur, x_mask_dur, logw_real, logw_det, g=g_dur
+                )
+                dur_mask = x_mask_dur.transpose(1, 2).float()
+                dur_mask_sum = dur_mask.sum().clamp_min(1.0)
+                loss_dur_gen = (
+                    torch.sum(((1.0 - y_dur_g.float()) ** 2) * dur_mask) / dur_mask_sum
+                )
+                loss_gen_all = loss_gen_all + loss_dur_gen
+
             # Multi-resolution STFT discriminator (adversarial + feature match)
             loss_mrd_gen = y.new_zeros(())
             loss_mrd_fm = y.new_zeros(())
@@ -364,6 +400,25 @@ class VitsModel(L.LightningModule):
                 loss_mrd_disc, _, _ = discriminator_loss(y_dr_r_det, y_dr_g_det)
                 loss_disc_all = loss_disc_all + loss_mrd_disc
 
+            loss_dur_disc = y.new_zeros(())
+            if (self.model_dur_disc is not None) and (dur_info is not None):
+                x_dur, x_mask_dur, g_dur, logw_real, logw_det = dur_info
+                y_dur_r, y_dur_g = self.model_dur_disc(
+                    x_dur.detach(),
+                    x_mask_dur.detach(),
+                    logw_real.detach(),
+                    logw_det.detach(),
+                    g=g_dur.detach() if g_dur is not None else None,
+                )
+                dur_mask = x_mask_dur.transpose(1, 2).float()
+                dur_mask_sum = dur_mask.sum().clamp_min(1.0)
+                r_loss = (
+                    torch.sum(((1.0 - y_dur_r.float()) ** 2) * dur_mask) / dur_mask_sum
+                )
+                g_loss = torch.sum((y_dur_g.float() ** 2) * dur_mask) / dur_mask_sum
+                loss_dur_disc = r_loss + g_loss
+                loss_disc_all = loss_disc_all + loss_dur_disc
+
         # Individual components for logging/monitoring. "mel" is the raw
         # (unweighted) mel L1, which is the most quality-correlated signal and
         # the recommended target for early stopping/checkpointing -- unlike the
@@ -380,6 +435,9 @@ class VitsModel(L.LightningModule):
             metrics["mrd_gen"] = loss_mrd_gen.detach()
             metrics["mrd_fm"] = loss_mrd_fm.detach()
             metrics["mrd_disc"] = loss_mrd_disc.detach()
+        if self.model_dur_disc is not None:
+            metrics["dur_gen"] = loss_dur_gen.detach()
+            metrics["dur_disc"] = loss_dur_disc.detach()
 
         return loss_gen_all, loss_disc_all, metrics
 
@@ -419,6 +477,13 @@ class VitsModel(L.LightningModule):
         opt_d.zero_grad()
         self.manual_backward(loss_d)
         opt_d.step()
+
+        if self.model_g.use_noise_scaled_mas:
+            decayed = (
+                self.model_g.mas_noise_scale_initial
+                - self.model_g.noise_scale_delta * (self.global_step // 2)
+            )
+            self.model_g.current_mas_noise_scale = max(decayed, 0.0)
 
     def on_train_start(self) -> None:
         self._reassert_scheduler_gammas()
@@ -780,6 +845,8 @@ class VitsModel(L.LightningModule):
         disc_params = list(self.model_d.parameters())
         if self.model_mrd is not None:
             disc_params += list(self.model_mrd.parameters())
+        if self.model_dur_disc is not None:
+            disc_params += list(self.model_dur_disc.parameters())
 
         optimizers = [
             torch.optim.AdamW(

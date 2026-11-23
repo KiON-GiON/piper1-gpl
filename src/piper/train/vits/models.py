@@ -615,6 +615,74 @@ class MultiResolutionDiscriminator(torch.nn.Module):
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
+class DurationDiscriminator(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        filter_channels: int,
+        kernel_size: int,
+        p_dropout: float,
+        gin_channels: int = 0,
+    ):
+        super().__init__()
+        self.drop = nn.Dropout(p_dropout)
+        self.conv_1 = nn.Conv1d(
+            in_channels, filter_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.norm_1 = modules.LayerNorm(filter_channels)
+        self.conv_2 = nn.Conv1d(
+            filter_channels, filter_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.norm_2 = modules.LayerNorm(filter_channels)
+        self.dur_proj = nn.Conv1d(1, filter_channels, 1)
+
+        self.pre_out_conv_1 = nn.Conv1d(
+            2 * filter_channels, filter_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.pre_out_norm_1 = modules.LayerNorm(filter_channels)
+        self.pre_out_conv_2 = nn.Conv1d(
+            filter_channels, filter_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.pre_out_norm_2 = modules.LayerNorm(filter_channels)
+
+        self.cond = (
+            nn.Conv1d(gin_channels, in_channels, 1) if gin_channels != 0 else None
+        )
+        self.output_layer = nn.Sequential(nn.Linear(filter_channels, 1), nn.Sigmoid())
+
+    def _forward_probability(self, x, x_mask, dur):
+        dur = self.dur_proj(dur)
+        h = torch.cat([x, dur], dim=1)
+        h = self.pre_out_conv_1(h * x_mask)
+        h = torch.relu(h)
+        h = self.pre_out_norm_1(h)
+        h = self.drop(h)
+        h = self.pre_out_conv_2(h * x_mask)
+        h = torch.relu(h)
+        h = self.pre_out_norm_2(h)
+        h = self.drop(h)
+        h = (h * x_mask).transpose(1, 2)
+        return self.output_layer(h)
+
+    def forward(self, x, x_mask, dur_r, dur_hat, g=None):
+        x = torch.detach(x)
+        if g is not None and self.cond is not None:
+            x = x + self.cond(torch.detach(g))
+        x = self.conv_1(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_1(x)
+        x = self.drop(x)
+        x = self.conv_2(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_2(x)
+        x = self.drop(x)
+
+        return (
+            self._forward_probability(x, x_mask, dur_r),
+            self._forward_probability(x, x_mask, dur_hat),
+        )
+
+
 class SynthesizerTrn(nn.Module):
     """
     Synthesizer for Training
@@ -641,6 +709,11 @@ class SynthesizerTrn(nn.Module):
         n_speakers: int = 1,
         gin_channels: int = 0,
         use_sdp: bool = True,
+        use_det_dp: bool = False,
+        sdp_ratio: typing.Optional[float] = None,
+        use_noise_scaled_mas: bool = False,
+        mas_noise_scale_initial: float = 0.01,
+        noise_scale_delta: float = 2e-6,
     ):
 
         super().__init__()
@@ -706,6 +779,17 @@ class SynthesizerTrn(nn.Module):
             self.dp = DurationPredictor(
                 hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
             )
+        self.sdp_ratio = sdp_ratio
+        self.use_noise_scaled_mas = use_noise_scaled_mas
+        self.mas_noise_scale_initial = mas_noise_scale_initial
+        self.noise_scale_delta = noise_scale_delta
+        self.current_mas_noise_scale = mas_noise_scale_initial
+
+        self.det_dp: typing.Optional[DurationPredictor] = None
+        if use_det_dp:
+            self.det_dp = DurationPredictor(
+                hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
+            )
 
         if n_speakers > 1:
             self.emb_g = nn.Embedding(n_speakers, gin_channels)
@@ -740,6 +824,14 @@ class SynthesizerTrn(nn.Module):
             )  # [b, 1, t_s]
             neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
 
+            if self.use_noise_scaled_mas:
+                epsilon = (
+                    torch.std(neg_cent)
+                    * torch.randn_like(neg_cent)
+                    * self.current_mas_noise_scale
+                )
+            neg_cent = neg_cent + epsilon
+
             attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
             attn = (
                 monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1))
@@ -749,14 +841,22 @@ class SynthesizerTrn(nn.Module):
 
         w = attn.sum(2)
         if self.use_sdp:
-            l_length = self.dp(x, x_mask, w, g=g)
-            l_length = l_length / torch.sum(x_mask)
+            l_length_sdp = self.dp(x, x_mask, w, g=g)
+            l_length = l_length_sdp / torch.sum(x_mask)
         else:
             logw_ = torch.log(w + 1e-6) * x_mask
             logw = self.dp(x, x_mask, g=g)
-            l_length = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
+            l_length = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
+
+        dur_info = None
+        if self.det_dp is not None:
+            logw_real = torch.log(w + 1e-6) * x_mask
+            logw_det = self.det_dp(x, x_mask, g=g)
+            l_length_det = torch.sum((logw_det - logw_real) ** 2, [1, 2]) / torch.sum(
                 x_mask
-            )  # for averaging
+            )
+            l_length = l_length + l_length_det
+            dur_info = (x, x_mask, g, logw_real, logw_det)
 
         # expand prior
         m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
@@ -774,7 +874,27 @@ class SynthesizerTrn(nn.Module):
             x_mask,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
+            dur_info,
         )
+
+    def predict_logw(self, x, x_mask, g=None, noise_scale_w=0.8):
+        if self.use_sdp:
+            logw_sdp = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+        else:
+            logw_sdp = self.dp(x, x_mask, g=g)
+
+        if self.det_dp is None:
+            return logw_sdp
+
+        logw_det = self.det_dp(x, x_mask, g=g)
+        if not self.use_sdp:
+            return logw_det
+
+        if self.sdp_ratio is None:
+            ratio = torch.clamp(noise_scale_w, 0.0, 1.0)
+        else:
+            ratio = self.sdp_ratio
+        return logw_sdp * ratio + logw_det * (1.0 - ratio)
 
     def infer(
         self,
@@ -794,9 +914,8 @@ class SynthesizerTrn(nn.Module):
             g = None
 
         if self.use_sdp:
-            logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
-        else:
-            logw = self.dp(x, x_mask, g=g)
+            logw = self.predict_logw(x, x_mask, g=g, noise_scale_w=noise_scale_w)
+
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
