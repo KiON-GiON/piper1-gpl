@@ -830,7 +830,7 @@ class SynthesizerTrn(nn.Module):
                     * torch.randn_like(neg_cent)
                     * self.current_mas_noise_scale
                 )
-            neg_cent = neg_cent + epsilon
+                neg_cent = neg_cent + epsilon
 
             attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
             attn = (
