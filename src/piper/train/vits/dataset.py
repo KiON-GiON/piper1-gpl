@@ -611,11 +611,13 @@ class VitsDataModule(L.LightningDataModule):
                 self.batch_size,
             )
         if self.length_bucketing:
-            # random_split hands back a Subset, so map the subset positions
-            # back onto the CachedUtterance records the sampler measures.
-            utterances = [
-                self.train_dataset.dataset.utts[i] for i in self.train_dataset.indices
-            ]
+            if hasattr(self.train_dataset, "dataset") and hasattr(self.train_dataset, "indices"):
+                utterances = [
+                    self.train_dataset.dataset.utts[i] for i in self.train_dataset.indices
+                ]
+            else:
+                utterances = getattr(self.train_dataset, "utts", self.train_dataset)
+
             _LOGGER.info(
                 "Length bucketing enabled (window %s batches)",
                 self.bucket_multiplier,
@@ -725,54 +727,54 @@ class Batch:
 
 
 class LengthBucketSampler(Sampler[List[int]]):
-    """Batch sampler that groups utterances of similar length together.
+    """Batch sampler that groups utterances of similar length together,
 
-    UtteranceCollate pads every batch to its longest member, and nothing else
-    orders the data, so a uniformly shuffled batch is padded to roughly the
-    longest utterance in the corpus. On a corpus whose p90 is 11 s but whose
-    tail reaches 20 s, almost every batch drags in something near the tail and
-    the padding dominates.
-
-    Each epoch the indices are shuffled, cut into windows of
-    `batch_size * bucket_multiplier`, and sorted by length inside the window
-    before being split into batches. Batch order is then shuffled again. That
-    keeps the sampling stochastic while making individual batches
-    length-homogeneous.
-
-    Lengths come from the size of the cached audio tensor on disk. It is a
-    plain 1-D float32 tensor, so its byte size is proportional to its sample
-    count, and os.stat costs nothing next to loading every tensor up front.
+    distributed-aware (DDP safe).
     """
 
     def __init__(
         self,
-        utterances: Sequence["CachedUtterance"],
+        utterances: Sequence[Union["CachedUtterance", int]],
         batch_size: int,
         drop_last: bool = True,
         bucket_multiplier: int = 32,
-        generator: Optional[torch.Generator] = None,
+        seed: int = 0,
     ) -> None:
         super().__init__()
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.window = max(batch_size, batch_size * bucket_multiplier)
-        self.generator = generator
+        self.seed = seed
+        self.epoch = 0
+
+        # DDP info
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.num_replicas = torch.distributed.get_world_size()
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.num_replicas = 1
+            self.rank = 0
 
         self.lengths: List[int] = []
         for utt in utterances:
-            try:
-                self.lengths.append(os.path.getsize(utt.audio_norm_path))
-            except OSError:
-                # Sorts with the shortest; a missing file fails later anyway.
+            if hasattr(utt, "audio_norm_path"):
+                try:
+                    self.lengths.append(os.path.getsize(utt.audio_norm_path))
+                except OSError:
+                    self.lengths.append(0)
+            elif isinstance(utt, int):
+                self.lengths.append(utt)
+            else:
                 self.lengths.append(0)
 
-    def __len__(self) -> int:
-        if self.drop_last:
-            return len(self.lengths) // self.batch_size
-        return math.ceil(len(self.lengths) / self.batch_size)
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
     def __iter__(self):
-        order = torch.randperm(len(self.lengths), generator=self.generator).tolist()
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        order = torch.randperm(len(self.lengths), generator=g).tolist()
 
         batches: List[List[int]] = []
         for start in range(0, len(order), self.window):
@@ -785,8 +787,23 @@ class LengthBucketSampler(Sampler[List[int]]):
                     continue
                 batches.append(batch)
 
-        for index in torch.randperm(len(batches), generator=self.generator).tolist():
-            yield batches[index]
+        batch_order = torch.randperm(len(batches), generator=g).tolist()
+        shuffled_batches = [batches[i] for i in batch_order]
+
+        if self.num_replicas > 1:
+            total_batches = (len(shuffled_batches) // self.num_replicas) * self.num_replicas
+            shuffled_batches = shuffled_batches[:total_batches]
+            shuffled_batches = shuffled_batches[self.rank :: self.num_replicas]
+
+        for batch in shuffled_batches:
+            yield batch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            total_batches = len(self.lengths) // self.batch_size
+        else:
+            total_batches = math.ceil(len(self.lengths) / self.batch_size)
+        return total_batches // self.num_replicas
 
 
 class VitsDataset(Dataset):
