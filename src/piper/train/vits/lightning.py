@@ -110,6 +110,7 @@ class VitsModel(L.LightningModule):
         use_noise_scaled_mas: bool = False,
         mas_noise_scale_initial: float = 0.01,
         noise_scale_delta: float = 2e-6,
+        use_spk_conditioned_encoder: bool = False,
         segment_size: int = 8192,
         # Multi-Resolution STFT Discriminator (UnivNet/Vocos-style). Training-
         # only: sharpens spectral detail the period discriminators miss, at
@@ -243,6 +244,7 @@ class VitsModel(L.LightningModule):
             use_noise_scaled_mas=self.hparams.use_noise_scaled_mas,
             mas_noise_scale_initial=self.hparams.mas_noise_scale_initial,
             noise_scale_delta=self.hparams.noise_scale_delta,
+            use_spk_conditioned_encoder=self.hparams.use_spk_conditioned_encoder,
         )
         self.model_dur_disc: Optional[DurationDiscriminator] = None
         if self.hparams.use_dur_disc:

@@ -181,6 +181,7 @@ class TextEncoder(nn.Module):
         n_layers: int,
         kernel_size: int,
         p_dropout: float,
+        gin_channels: int = 0,
     ):
         super().__init__()
         self.n_vocab = n_vocab
@@ -196,18 +197,18 @@ class TextEncoder(nn.Module):
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
 
         self.encoder = attentions.Encoder(
-            hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
+            hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, gin_channels=gin_channels
         )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def forward(self, x, x_lengths):
+    def forward(self, x, x_lengths, g=None):
         x = self.emb(x) * math.sqrt(self.hidden_channels)  # [b, t, h]
         x = torch.transpose(x, 1, -1)  # [b, h, t]
         x_mask = torch.unsqueeze(
             commons.sequence_mask(x_lengths, x.size(2)), 1
         ).type_as(x)
 
-        x = self.encoder(x * x_mask, x_mask)
+        x = self.encoder(x * x_mask, x_mask, g=g)
         stats = self.proj(x) * x_mask
 
         m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -714,6 +715,7 @@ class SynthesizerTrn(nn.Module):
         use_noise_scaled_mas: bool = False,
         mas_noise_scale_initial: float = 0.01,
         noise_scale_delta: float = 2e-6,
+        use_spk_conditioned_encoder: bool = False,
     ):
 
         super().__init__()
@@ -738,6 +740,11 @@ class SynthesizerTrn(nn.Module):
 
         self.use_sdp = use_sdp
 
+        enc_gin_channels = (
+            gin_channels
+            if (use_spk_conditioned_encoder and n_speakers > 1 and gin_channels > 0)
+            else 0
+        )
         self.enc_p = TextEncoder(
             n_vocab,
             inter_channels,
@@ -747,6 +754,7 @@ class SynthesizerTrn(nn.Module):
             n_layers,
             kernel_size,
             p_dropout,
+            gin_channels=enc_gin_channels,
         )
         self.dec = Generator(
             inter_channels,
@@ -798,12 +806,12 @@ class SynthesizerTrn(nn.Module):
         # Import here so we can avoid building the module for inference only
         from . import monotonic_align
 
-        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
         if self.n_speakers > 1:
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = None
 
+        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
 
@@ -906,13 +914,13 @@ class SynthesizerTrn(nn.Module):
         noise_scale_w=0.8,
         max_len=None,
     ):
-        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
         if self.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = None
 
+        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
         if self.use_sdp:
             logw = self.predict_logw(x, x_mask, g=g, noise_scale_w=noise_scale_w)
 

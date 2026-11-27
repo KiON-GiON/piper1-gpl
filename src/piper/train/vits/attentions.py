@@ -19,6 +19,8 @@ class Encoder(nn.Module):
         kernel_size: int = 1,
         p_dropout: float = 0.0,
         window_size: int = 4,
+        gin_channels: int = 0,
+        cond_layer_idx: int = 2,
         **kwargs
     ):
         super().__init__()
@@ -29,6 +31,14 @@ class Encoder(nn.Module):
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
         self.window_size = window_size
+
+        self.cond_layer_idx = cond_layer_idx
+        self.cond_layer: typing.Optional[nn.Conv1d] = None
+        if gin_channels != 0:
+            self.cond_layer = nn.Conv1d(gin_channels, hidden_channels, 1)
+            nn.init.zeros_(self.cond_layer.weight)
+            if self.cond_layer.bias is not None:
+                nn.init.zeros_(self.cond_layer.bias)
 
         self.drop = nn.Dropout(p_dropout)
         self.attn_layers = nn.ModuleList()
@@ -57,12 +67,14 @@ class Encoder(nn.Module):
             )
             self.norm_layers_2.append(LayerNorm(hidden_channels))
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, g=None):
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         for attn_layer, norm_layer_1, ffn_layer, norm_layer_2 in zip(
             self.attn_layers, self.norm_layers_1, self.ffn_layers, self.norm_layers_2
         ):
+            if self.cond_layer is not None and g is not None and i == self.cond_layer_idx:
+                x = (x + self.cond_layer(g)) * x_mask
             y = attn_layer(x, x, attn_mask)
             y = self.drop(y)
             x = norm_layer_1(x + y)
